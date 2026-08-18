@@ -1,15 +1,17 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 import { WebSocket } from "ws";
 import { createOpsServer } from "../dist/app.js";
 
 const temporaryDirectory = mkdtempSync(join(tmpdir(), "ops-console-smoke-"));
+const frontendDirectory = mkdtempSync(join(tmpdir(), "ops-console-frontend-"));
+writeFileSync(join(frontendDirectory, "index.html"), "<!doctype html><html><body><div id=\"root\"></div></body></html>\n");
 assert.throws(() => createOpsServer({ dbPath: join(temporaryDirectory, "unauthenticated.sqlite") }), /OPS_ADMIN_TOKEN/);
 const app = createOpsServer({
   dbPath: join(temporaryDirectory, "ops.sqlite"),
-  frontendDir: resolve("dist"),
+  frontendDir: frontendDirectory,
   adminToken: "smoke-admin-token",
   heartbeatTimeoutMs: 2_000,
   logger: { info() {}, warn() {}, error: console.error },
@@ -387,4 +389,5 @@ try {
   }
   await app.close();
   rmSync(temporaryDirectory, { recursive: true, force: true });
+  rmSync(frontendDirectory, { recursive: true, force: true });
 }
