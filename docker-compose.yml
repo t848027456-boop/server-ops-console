@@ -9,7 +9,7 @@ services:
       OPS_FRONTEND_DIR: /app/dist
       OPS_DB_PATH: /data/ops-console.sqlite
     ports:
-      - "8787:8787"
+      - "${OPS_PUBLISH_ADDRESS:-127.0.0.1}:${OPS_PUBLISH_PORT:-8787}:${OPS_PORT:-8787}"
     volumes:
       - ops-console-data:/data
     healthcheck:

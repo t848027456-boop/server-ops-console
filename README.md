@@ -55,7 +55,7 @@ docker compose up -d --build
 docker compose logs -f console
 ```
 
-SQLite 数据保存在 `ops-console-data` 卷中。升级前先备份该卷；控制端只绑定管理 API，Agent 仍通过主动 WebSocket 回连。生产环境应在前面配置 TLS、访问控制和备份策略，详见 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)。
+SQLite 数据保存在 `ops-console-data` 卷中。默认只发布到宿主机 `127.0.0.1:8787`；升级前先备份该卷，生产环境通过 TLS 反向代理开放，Agent 仍通过主动 WebSocket 回连。详见 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)。
 
 ## 接入 Agent
 

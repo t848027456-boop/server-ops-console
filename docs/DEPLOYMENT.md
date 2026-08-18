@@ -6,7 +6,7 @@ The supported production shape is a single control-plane container with a persis
 
 1. Create a long random `OPS_ADMIN_TOKEN` and place it in `.env`.
 2. Start with `docker compose up -d --build`.
-3. Allow the reverse proxy to reach port 8787, but do not expose the container directly to the public internet.
+3. Keep `OPS_PUBLISH_ADDRESS=127.0.0.1` and let the reverse proxy reach `OPS_PUBLISH_PORT`; do not expose the container directly to the public internet.
 4. Back up `/data/ops-console.sqlite` before upgrades and before changing the container image.
 5. Keep the health endpoint available to the proxy: `GET /api/v1/health`.
 
