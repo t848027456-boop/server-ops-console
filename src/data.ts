@@ -112,3 +112,37 @@ export interface Overview {
   connectedAgents: number;
   generatedAt: string;
 }
+
+export interface BootstrapPreflightCheck {
+  name: string;
+  ok: boolean;
+  detail?: string;
+  code?: string;
+}
+
+export interface BootstrapPreflight {
+  preflightId: string;
+  host?: string;
+  port?: number;
+  username?: string;
+  hostKeyFingerprint: string;
+  hostKeyType?: string;
+  checks: BootstrapPreflightCheck[];
+  os?: string;
+  sshVersion?: string;
+  expiresAt?: string;
+  authenticationRequired?: boolean;
+}
+
+export interface BootstrapJob {
+  jobId: string;
+  status: string;
+  stage?: string | null;
+  progress?: number | null;
+  errorCode?: string | null;
+  rollbackState?: string | null;
+  message?: string | null;
+  createdAt?: string | null;
+  updatedAt?: string | null;
+  finishedAt?: string | null;
+}

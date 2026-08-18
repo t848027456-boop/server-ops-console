@@ -15,11 +15,13 @@ import {
   CloudCog,
   Code2,
   FileClock,
+  Fingerprint,
   Globe2,
   History,
   LayoutDashboard,
   ListChecks,
   LoaderCircle,
+  KeyRound,
   LockKeyhole,
   Menu,
   MoreHorizontal,
@@ -32,11 +34,12 @@ import {
   Search,
   Server as ServerIcon,
   ShieldCheck,
+  Terminal,
   UserRound,
   X,
 } from "lucide-react";
 import { api, waitForTask } from "./api";
-import type { AlertItem, AuditItem, Health, Overview, Project, Server, Task } from "./data";
+import type { AlertItem, AuditItem, BootstrapJob, BootstrapPreflight, Health, Overview, Project, Server, Task } from "./data";
 
 type Page = "dashboard" | "servers" | "projects" | "releases" | "alerts" | "audit";
 type ProjectFilter = "all" | "issues" | "actions";
@@ -330,14 +333,280 @@ function PreflightModal({ project, serverConnected, onClose, onChanged }: { proj
       {!serverConnected ? <div className="inline-error"><AlertCircle size={16} />Agent 未连接，暂时不能运行预检</div> : error ? <div className="inline-error"><AlertCircle size={16} />{error}</div> : null}<div className="modal-actions"><button className="button button--secondary" type="button" onClick={onClose}>关闭</button><button className="button button--primary" type="button" disabled={busy || !serverConnected} onClick={() => void run()}>{busy ? <LoaderCircle className="spin" size={16} /> : <ListChecks size={16} />}{busy ? "Agent 执行中" : task ? "重新预检" : "运行预检"}</button></div></section></div>;
 }
 
-function EnrollmentModal({ onClose, onCreated }: { onClose: () => void; onCreated: () => Promise<void> }) {
+type EnrollmentMode = "token" | "ssh";
+
+interface SshEnrollmentForm {
+  id: string;
+  name: string;
+  region: string;
+  address: string;
+  sshPort: string;
+  sshUsername: string;
+  password: string;
+  rootRiskAccepted: boolean;
+}
+
+const bootstrapStages = [
+  { id: "connecting", label: "连接 SSH" },
+  { id: "preflight", label: "确认主机" },
+  { id: "staging", label: "准备 Agent" },
+  { id: "installing", label: "安装服务" },
+  { id: "verifying", label: "等待心跳" },
+];
+
+function bootstrapTerminal(job: BootstrapJob) {
+  return ["succeeded", "failed", "cancelled", "rollback_unknown"].includes(job.status) || job.stage === "succeeded";
+}
+
+function bootstrapStageLabel(job: BootstrapJob) {
+  if (job.status === "succeeded" || job.stage === "succeeded") return "Agent 已连接";
+  if (job.status === "failed") return "安装失败";
+  if (job.status === "cancelled") return "安装已取消";
+  if (job.status === "rollback_unknown") return "需要人工复核";
+  const labels: Record<string, string> = {
+    pending: "等待安装",
+    queued: "等待安装",
+    connecting: "连接 SSH",
+    checking_remote: "检查远端环境",
+    uploading_agent: "上传 Agent",
+    installing_agent: "安装 Agent",
+    starting_agent: "启动 Agent",
+    waiting_for_heartbeat: "等待 Agent 心跳",
+    cleaning_up: "清理临时文件",
+    rolling_back: "恢复安装前状态",
+    completed: "Agent 已连接",
+  };
+  const stage = job.stage || job.status;
+  return labels[stage] || bootstrapStages.find((item) => item.id === stage)?.label || stage || "处理中";
+}
+
+function bootstrapVisualStage(job: BootstrapJob) {
+  const stage = job.stage || job.status;
+  if (["pending", "queued", "connecting"].includes(stage)) return "connecting";
+  if (stage === "checking_remote") return "preflight";
+  if (stage === "uploading_agent") return "staging";
+  if (["installing_agent", "starting_agent"].includes(stage)) return "installing";
+  if (["waiting_for_heartbeat", "cleaning_up", "rolling_back"].includes(stage)) return "verifying";
+  if (stage === "completed" || job.status === "succeeded") return "succeeded";
+  return stage;
+}
+
+function bootstrapError(reason: unknown, fallback: string, secret = "") {
+  let message = reason instanceof Error ? reason.message : fallback;
+  if (secret) message = message.split(secret).join("[已隐藏]");
+  return message.replace(/((?:password|passwd|secret)\s*[=:]\s*)[^\s,;]+/gi, "$1[已隐藏]");
+}
+
+function EnrollmentModal({ onClose, onCreated }: { onClose: () => Promise<void> | void; onCreated: () => Promise<void> }) {
+  const [mode, setMode] = useState<EnrollmentMode>("token");
   const [form, setForm] = useState({ id: "", name: "", region: "", address: "" });
   const [credential, setCredential] = useState<{ agentToken: string; websocketPath: string } | null>(null);
-  const [busy, setBusy] = useState(false);
+  const [sshForm, setSshForm] = useState<SshEnrollmentForm>({ id: "", name: "", region: "", address: "", sshPort: "22", sshUsername: "root", password: "", rootRiskAccepted: false });
+  const [preflight, setPreflight] = useState<BootstrapPreflight | null>(null);
+  const [fingerprintConfirmed, setFingerprintConfirmed] = useState(false);
+  const [job, setJob] = useState<BootstrapJob | null>(null);
+  const [busy, setBusy] = useState<"token" | "preflight" | "bootstrap" | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const submit = async (event: FormEvent) => { event.preventDefault(); setBusy(true); setError(null); try { const result = await api.enrollServer(form); setCredential(result); await onCreated(); } catch (reason) { setError(reason instanceof Error ? reason.message : "接入失败"); } finally { setBusy(false); } };
+  const [jobError, setJobError] = useState<string | null>(null);
+
+  const rootUser = sshForm.sshUsername.trim().toLowerCase() === "root";
+  const port = Number(sshForm.sshPort);
+  const validPort = Number.isInteger(port) && port >= 1 && port <= 65_535;
+  const sshReady = Boolean(sshForm.id.trim() && sshForm.name.trim() && sshForm.address.trim() && sshForm.sshUsername.trim() && validPort);
+
+  const resetSshVerification = () => {
+    setPreflight(null);
+    setFingerprintConfirmed(false);
+    setJob(null);
+    setJobError(null);
+  };
+
+  const updateSsh = (patch: Partial<SshEnrollmentForm>) => {
+    setSshForm((current) => ({ ...current, ...patch }));
+    if (Object.keys(patch).some((key) => key !== "password" && key !== "rootRiskAccepted")) resetSshVerification();
+  };
+
+  const runPreflight = async () => {
+    if (!sshReady) { setError("请先填写服务器信息和有效的 SSH 端口"); return; }
+    setBusy("preflight");
+    setError(null);
+    setJobError(null);
+    resetSshVerification();
+    try {
+      const result = await api.bootstrapPreflight({ address: sshForm.address.trim(), sshPort: port, sshUsername: sshForm.sshUsername.trim() });
+      if (!result.preflightId || !result.hostKeyFingerprint) throw new Error("预检响应不完整，已停止继续操作");
+      setPreflight(result);
+    } catch (reason) {
+      setError(bootstrapError(reason, "SSH 预检失败", sshForm.password));
+    } finally {
+      setSshForm((current) => ({ ...current, password: "" }));
+      setBusy(null);
+    }
+  };
+
+  const submitBootstrap = async () => {
+    if (!preflight) { setError("请先完成 SSH 预检"); return; }
+    if (!fingerprintConfirmed) { setError("请确认主机指纹后再继续"); return; }
+    if (rootUser && !sshForm.rootRiskAccepted) { setError("root 用户需要先确认风险"); return; }
+    if (!sshForm.password) { setError("预检完成后请重新输入 SSH 密码"); return; }
+    const secret = sshForm.password;
+    setBusy("bootstrap");
+    setError(null);
+    setJobError(null);
+    setSshForm((current) => ({ ...current, password: "" }));
+    try {
+      const result = await api.bootstrap({
+        preflightId: preflight.preflightId,
+        id: sshForm.id.trim(),
+        name: sshForm.name.trim(),
+        region: sshForm.region.trim() || undefined,
+        address: sshForm.address.trim(),
+        sshPort: port,
+        sshUsername: sshForm.sshUsername.trim(),
+        password: secret,
+        hostKeyFingerprint: preflight.hostKeyFingerprint,
+        controlPlaneUrl: `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/api/v1/agent/ws`,
+      });
+      if (!result.jobId) throw new Error("控制端未返回安装任务 ID");
+      setJob(result);
+      await onCreated();
+    } catch (reason) {
+      setError(bootstrapError(reason, "提交一次性安装失败", secret));
+    } finally {
+      setSshForm((current) => ({ ...current, password: "" }));
+      setBusy(null);
+    }
+  };
+
+  useEffect(() => {
+    if (!job?.jobId || bootstrapTerminal(job)) return;
+    let disposed = false;
+    let timer: number | null = null;
+    const started = Date.now();
+    const poll = async () => {
+      if (disposed) return;
+      if (Date.now() - started > 5 * 60_000) {
+        setJobError("安装任务查询超时，任务可能仍在后台执行");
+        return;
+      }
+      try {
+        const next = await api.bootstrapJob(job.jobId);
+        if (disposed) return;
+        setJob(next);
+        setJobError(null);
+        if (!bootstrapTerminal(next)) timer = window.setTimeout(() => void poll(), 1_000);
+      } catch (reason) {
+        if (disposed) return;
+        setJobError(bootstrapError(reason, "暂时无法读取安装进度"));
+        timer = window.setTimeout(() => void poll(), 2_000);
+      }
+    };
+    timer = window.setTimeout(() => void poll(), 400);
+    return () => { disposed = true; if (timer !== null) window.clearTimeout(timer); };
+  }, [job?.jobId]);
+
   const configSnippet = credential ? JSON.stringify({ controlPlaneUrl: `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}${credential.websocketPath}`, token: credential.agentToken, server: { id: form.id, name: form.name, region: form.region, address: form.address }, projects: [] }, null, 2) : "";
-  return <div className="modal-shell"><section className="release-modal" role="dialog" aria-modal="true" aria-label="接入服务器"><div className="modal-head"><div><span className="eyebrow"><CloudCog size={14} /> Agent 接入</span><h2>接入服务器</h2></div><IconButton label="关闭" onClick={onClose}><X size={19} /></IconButton></div>{credential ? <div className="credential-result"><span className="success-badge"><CheckCircle2 size={24} /></span><h3>凭据已创建</h3><p>Token 仅在当前窗口显示一次。</p><div className="credential-box"><pre>{configSnippet}</pre><button type="button" title="复制配置" onClick={() => void navigator.clipboard.writeText(configSnippet)}><Clipboard size={16} /></button></div></div> : <form className="modal-form" onSubmit={submit}><label><span>服务器 ID</span><input required pattern="[a-zA-Z0-9][a-zA-Z0-9._-]{1,63}" value={form.id} onChange={(event) => setForm({ ...form, id: event.target.value })} placeholder="srv-sg-app" /></label><label><span>显示名称</span><input required value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} placeholder="SG 应用节点" /></label><div className="form-grid"><label><span>地区</span><input value={form.region} onChange={(event) => setForm({ ...form, region: event.target.value })} placeholder="新加坡" /></label><label><span>地址</span><input value={form.address} onChange={(event) => setForm({ ...form, address: event.target.value })} placeholder="203.0.113.10" /></label></div>{error ? <div className="inline-error"><AlertCircle size={16} />{error}</div> : null}</form>}<div className="modal-actions"><button className="button button--secondary" type="button" onClick={onClose}>{credential ? "完成" : "取消"}</button>{!credential ? <button className="button button--primary" type="button" disabled={busy || !form.id || !form.name} onClick={() => (document.querySelector(".modal-form") as HTMLFormElement)?.requestSubmit()}>{busy ? <LoaderCircle className="spin" size={16} /> : <Plus size={16} />}创建凭据</button> : null}</div></section></div>;
+  const activeStage = job && !bootstrapTerminal(job) ? bootstrapVisualStage(job) : "";
+  const isRootConfirmed = !rootUser || sshForm.rootRiskAccepted;
+  const sshSubmit = (event: FormEvent) => { event.preventDefault(); if (preflight) void submitBootstrap(); else void runPreflight(); };
+  const close = () => { setSshForm((current) => ({ ...current, password: "" })); void onClose(); };
+  const submitToken = async (event: FormEvent) => {
+    event.preventDefault();
+    setBusy("token");
+    setError(null);
+    try {
+      const result = await api.enrollServer(form);
+      setCredential(result);
+      await onCreated();
+    } catch (reason) {
+      setError(bootstrapError(reason, "接入失败"));
+    } finally {
+      setBusy(null);
+    }
+  };
+  const currentStageIndex = bootstrapStages.findIndex((item) => item.id === activeStage);
+  const sshInputsDisabled = busy !== null || Boolean(job);
+  const requestForm = (selector: string) => (document.querySelector(selector) as HTMLFormElement | null)?.requestSubmit();
+
+  const tokenBody = credential ? (
+    <div className="credential-result">
+      <span className="success-badge"><CheckCircle2 size={24} /></span>
+      <h3>凭据已创建</h3>
+      <p>Token 仅在当前窗口显示一次。</p>
+      <div className="credential-box">
+        <pre>{configSnippet}</pre>
+        <button type="button" title="复制配置" onClick={() => void navigator.clipboard.writeText(configSnippet)}><Clipboard size={16} /></button>
+      </div>
+    </div>
+  ) : (
+    <form className="modal-form" onSubmit={submitToken}>
+      <label><span>服务器 ID</span><input required pattern="[a-zA-Z0-9][a-zA-Z0-9._-]{1,63}" value={form.id} onChange={(event) => setForm({ ...form, id: event.target.value })} placeholder="srv-sg-app" /></label>
+      <label><span>显示名称</span><input required value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} placeholder="SG 应用节点" /></label>
+      <div className="form-grid">
+        <label><span>地区</span><input value={form.region} onChange={(event) => setForm({ ...form, region: event.target.value })} placeholder="新加坡" /></label>
+        <label><span>地址</span><input value={form.address} onChange={(event) => setForm({ ...form, address: event.target.value })} placeholder="203.0.113.10" /></label>
+      </div>
+      {error ? <div className="inline-error"><AlertCircle size={16} />{error}</div> : null}
+    </form>
+  );
+
+  const sshBody = (
+    <form className="modal-form enrollment-ssh-form" onSubmit={sshSubmit}>
+      <div className="form-grid">
+        <label><span>服务器 ID</span><input required disabled={sshInputsDisabled} pattern="[a-zA-Z0-9][a-zA-Z0-9._-]{1,63}" value={sshForm.id} onChange={(event) => updateSsh({ id: event.target.value })} placeholder="srv-sg-app" /></label>
+        <label><span>显示名称</span><input required disabled={sshInputsDisabled} value={sshForm.name} onChange={(event) => updateSsh({ name: event.target.value })} placeholder="SG 应用节点" /></label>
+      </div>
+      <div className="form-grid">
+        <label><span>地区</span><input disabled={sshInputsDisabled} value={sshForm.region} onChange={(event) => updateSsh({ region: event.target.value })} placeholder="新加坡" /></label>
+        <label><span>主机地址</span><input required disabled={sshInputsDisabled} autoComplete="off" value={sshForm.address} onChange={(event) => updateSsh({ address: event.target.value })} placeholder="203.0.113.10" /></label>
+      </div>
+      <div className="form-grid">
+        <label><span>SSH 端口</span><input required disabled={sshInputsDisabled} type="number" inputMode="numeric" min="1" max="65535" value={sshForm.sshPort} onChange={(event) => updateSsh({ sshPort: event.target.value })} /></label>
+        <label><span>SSH 用户（仅 root）</span><input required readOnly disabled={sshInputsDisabled} autoComplete="username" value={sshForm.sshUsername} placeholder="root" /></label>
+      </div>
+      <label><span>SSH 密码</span><input disabled={sshInputsDisabled} type="password" autoComplete="new-password" value={sshForm.password} onChange={(event) => updateSsh({ password: event.target.value })} placeholder={preflight ? "预检后重新输入" : "仅用于本次引导"} /></label>
+      {rootUser ? <label className="bootstrap-check bootstrap-check--risk"><input disabled={sshInputsDisabled} type="checkbox" checked={sshForm.rootRiskAccepted} onChange={(event) => updateSsh({ rootRiskAccepted: event.target.checked })} /><span>我确认此次 root 引导符合服务器安全策略</span></label> : null}
+      {preflight ? <div className="bootstrap-verification">
+        <div className="bootstrap-fingerprint"><Fingerprint size={18} /><div><span>SSH 主机指纹{preflight.hostKeyType ? ` · ${preflight.hostKeyType}` : ""}</span><code>{preflight.hostKeyFingerprint}</code></div></div>
+        <label className="bootstrap-check"><input disabled={sshInputsDisabled} type="checkbox" checked={fingerprintConfirmed} onChange={(event) => setFingerprintConfirmed(event.target.checked)} /><span>我确认这是目标服务器的主机指纹</span></label>
+        {preflight.checks.length ? <div className="bootstrap-checks">{preflight.checks.map((check) => <div key={`${check.name}-${check.code || ""}`}><span className={check.ok ? "check-icon check-icon--good" : "check-icon check-icon--warn"}>{check.ok ? <Check size={14} /> : <AlertTriangle size={14} />}</span><div><strong>{check.name}</strong><small>{check.detail || (check.ok ? "通过" : "未通过")}</small></div></div>)}</div> : null}
+      </div> : null}
+      {job ? <div className={`bootstrap-progress bootstrap-progress--${bootstrapTerminal(job) ? (job.status === "succeeded" ? "success" : "error") : "active"}`}>
+        <div className="bootstrap-progress__head"><div><strong>{bootstrapStageLabel(job)}</strong><small>{job.jobId}</small></div>{typeof job.progress === "number" ? <b>{Math.max(0, Math.min(100, Math.round(job.progress)))}%</b> : <LoaderCircle className={!bootstrapTerminal(job) ? "spin" : ""} size={17} />}</div>
+        <div className="bootstrap-stage-list">{bootstrapStages.map((stage, index) => {
+          const done = job.status === "succeeded" || currentStageIndex > index;
+          const active = currentStageIndex === index;
+          return <div className={`${done ? "is-done" : ""}${active ? " is-active" : ""}`} key={stage.id}><span>{done ? <Check size={12} /> : index + 1}</span><small>{stage.label}</small></div>;
+        })}</div>
+        {job.errorCode ? <div className="bootstrap-job-message"><AlertCircle size={14} /><span>错误码：<code>{job.errorCode}</code></span></div> : null}
+        {job.message ? <div className="bootstrap-job-message"><AlertCircle size={14} /><span>{job.message}</span></div> : null}
+        {job.rollbackState ? <div className="bootstrap-job-message bootstrap-job-message--warning"><AlertTriangle size={14} /><span>回滚状态：{job.rollbackState}</span></div> : null}
+        {jobError ? <div className="inline-error"><AlertCircle size={15} />{jobError}</div> : null}
+      </div> : null}
+      {error ? <div className="inline-error"><AlertCircle size={16} />{error}</div> : null}
+    </form>
+  );
+
+  return (
+    <div className="modal-shell">
+      <section className="release-modal enrollment-modal" role="dialog" aria-modal="true" aria-label="接入服务器">
+        <div className="modal-head">
+          <div><span className="eyebrow"><CloudCog size={14} /> Agent 接入</span><h2>接入服务器</h2></div>
+          <IconButton label="关闭" onClick={close}><X size={19} /></IconButton>
+        </div>
+        <div className="enrollment-tabs" role="tablist" aria-label="接入方式">
+          <button className={mode === "token" ? "is-active" : ""} type="button" role="tab" aria-selected={mode === "token"} onClick={() => { setSshForm((current) => ({ ...current, password: "" })); setMode("token"); setError(null); }}><KeyRound size={15} />手动 Token</button>
+          <button className={mode === "ssh" ? "is-active" : ""} type="button" role="tab" aria-selected={mode === "ssh"} onClick={() => { setMode("ssh"); setError(null); }}><Terminal size={15} />SSH 一次性安装</button>
+        </div>
+        {mode === "token" ? tokenBody : sshBody}
+        <div className="modal-actions">
+          <button className="button button--secondary" type="button" onClick={close}>{job ? (bootstrapTerminal(job) ? "完成" : "关闭") : mode === "token" && credential ? "完成" : "取消"}</button>
+          {mode === "token" && !credential ? <button className="button button--primary" type="button" disabled={busy !== null || !form.id || !form.name} onClick={() => requestForm(".enrollment-modal .modal-form")}>{busy === "token" ? <LoaderCircle className="spin" size={16} /> : <Plus size={16} />}{busy === "token" ? "正在创建" : "创建凭据"}</button> : null}
+          {mode === "ssh" && !job ? <button className="button button--primary" type="button" disabled={busy !== null || !sshReady || (Boolean(preflight) && (!fingerprintConfirmed || !sshForm.password || !isRootConfirmed))} onClick={() => requestForm(".enrollment-modal .enrollment-ssh-form")}>{busy ? <LoaderCircle className="spin" size={16} /> : preflight ? <ShieldCheck size={16} /> : <Fingerprint size={16} />}{busy === "preflight" ? "正在预检" : busy === "bootstrap" ? "正在提交" : preflight ? "提交一次性安装" : "预检 SSH"}</button> : null}
+        </div>
+      </section>
+    </div>
+  );
 }
 
 function ProjectModal({ servers, onClose, onCreated }: { servers: Server[]; onClose: () => void; onCreated: () => Promise<void> }) {

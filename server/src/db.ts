@@ -200,6 +200,40 @@ export class OpsDatabase {
     return this.getServer(input.id)!;
   }
 
+  setAgentTokenHash(serverId: string, tokenHash: string | null) {
+    this.sqlite.prepare("UPDATE servers SET agent_token_hash = ?, updated_at = ? WHERE id = ?")
+      .run(tokenHash, isoNow(), serverId);
+    return this.getServer(serverId);
+  }
+
+  setAgentTokenHashIfCurrent(serverId: string, expectedHash: string | null, nextHash: string | null) {
+    const result = expectedHash === null
+      ? this.sqlite.prepare("UPDATE servers SET agent_token_hash = ?, updated_at = ? WHERE id = ? AND agent_token_hash IS NULL")
+        .run(nextHash, isoNow(), serverId)
+      : this.sqlite.prepare("UPDATE servers SET agent_token_hash = ?, updated_at = ? WHERE id = ? AND agent_token_hash = ?")
+        .run(nextHash, isoNow(), serverId, expectedHash);
+    return Number(result.changes ?? 0) === 1;
+  }
+
+  restoreServer(row: ServerRow) {
+    this.sqlite.prepare(`UPDATE servers SET name = ?, region = ?, address = ?, os = ?, health = ?,
+      cpu = ?, memory = ?, disk = ?, load = ?, last_heartbeat = ?, agent_version = ?,
+      agent_token_hash = ?, maintenance_mode = ?, created_at = ?, updated_at = ? WHERE id = ?`).run(
+      row.name, row.region, row.address, row.os, row.health, row.cpu, row.memory, row.disk, row.load,
+      row.last_heartbeat, row.agent_version, row.agent_token_hash, row.maintenance_mode,
+      row.created_at, row.updated_at, row.id,
+    );
+    return this.getServer(row.id);
+  }
+
+  deleteServerIfUnreferenced(serverId: string) {
+    const result = this.sqlite.prepare(`DELETE FROM servers WHERE id = ?
+      AND NOT EXISTS (SELECT 1 FROM projects WHERE server_id = ?)
+      AND NOT EXISTS (SELECT 1 FROM tasks WHERE server_id = ?)`)
+      .run(serverId, serverId, serverId);
+    return Number(result.changes ?? 0) === 1;
+  }
+
   updateHeartbeat(serverId: string, input: {
     timestamp: string;
     health: string;

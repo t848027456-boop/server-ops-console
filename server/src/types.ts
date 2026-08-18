@@ -81,6 +81,7 @@ export interface TaskRow {
 
 export interface AgentSession {
   serverId: string;
+  sessionId: string;
   connectedAt: string;
   socket: WebSocket;
 }

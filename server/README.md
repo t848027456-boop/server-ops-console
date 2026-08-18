@@ -27,6 +27,14 @@ OPS_FRONTEND_DIR=dist
 OPS_ADMIN_TOKEN=<control-plane bearer token>
 OPS_HEARTBEAT_TIMEOUT_MS=45000
 OPS_ALLOW_INSECURE_LOCAL=0
+OPS_AGENT_CONTROL_PLANE_URL=wss://ops.example.com/api/v1/agent/ws
+OPS_AGENT_BUNDLE_PATH=agent/dist/ops-agent.cjs
+OPS_BOOTSTRAP_MAX_CONCURRENT=2
+OPS_BOOTSTRAP_TIMEOUT_MS=180000
+OPS_SSH_READY_TIMEOUT_MS=15000
+OPS_BOOTSTRAP_ALLOW_PRIVATE_ADDRESSES=0
+OPS_BOOTSTRAP_ALLOW_HOSTNAMES=0
+OPS_TRUST_PROXY=0
 ```
 
 `OPS_ADMIN_TOKEN` is required by default, including when a reverse proxy talks to the service over loopback. Set `OPS_ALLOW_INSECURE_LOCAL=1` only for an isolated development session. In the UI, open the owner entry at the bottom of the sidebar and enter the same token; it is kept in browser session storage and cleared when that browser session ends.
@@ -45,6 +53,11 @@ GET  /api/v1/overview
 
 GET  /api/v1/servers
 POST /api/v1/servers/enrollment-token
+POST /api/v1/servers/bootstrap/preflight
+POST /api/v1/servers/bootstrap
+GET  /api/v1/servers/bootstrap
+GET  /api/v1/servers/bootstrap/:jobId
+POST /api/v1/servers/bootstrap/:jobId/cancel
 GET  /api/v1/servers/:id
 POST /api/v1/servers/:id/refresh
 
@@ -65,6 +78,16 @@ POST /api/v1/alerts/:id/acknowledge
 GET  /api/v1/audit
 GET  /api/v1/audit-events
 ```
+
+## One-time SSH bootstrap
+
+SSH bootstrap is a short-lived installation path, not a long-term password store. First call `POST /api/v1/servers/bootstrap/preflight` with `address`, optional `sshPort`, and optional `sshUsername`. The response contains an OpenSSH-style `SHA256:` host-key fingerprint, key type, and an expiring `preflightId`. Show that fingerprint to the operator before requesting a password.
+
+After confirmation, call `POST /api/v1/servers/bootstrap` with the same target, `preflightId`, `hostKeyFingerprint`, server `id`/`name`, and `password`. The password is removed from the parsed request immediately and is never written to SQLite, audit events, job state, logs, URLs, environment variables, or command arguments. The worker uploads the bundled Agent, a token-only environment file, its config, and a fixed systemd unit; success requires a fresh Agent heartbeat from the new Agent session.
+
+Production bootstrap requires a `wss://` control-plane URL. Set `OPS_AGENT_CONTROL_PLANE_URL` on the server and set `OPS_TRUST_PROXY=1` only when a trusted TLS reverse proxy terminates HTTPS and forwards `X-Forwarded-Proto`. `OPS_ALLOW_INSECURE_LOCAL=1` is limited to a loopback development process.
+
+Bootstrap jobs are memory-only and expose `stage`, `progress`, fixed `errorCode` values, cancellation, and `rollback_unknown` when a remote rollback cannot be verified. The preflight token is single-use and expires after ten minutes. By default the SSH target must be a public IP literal; loopback, link-local/cloud-metadata, carrier-grade NAT, multicast, private addresses, and hostnames are rejected. Private addresses and hostnames require the explicit environment switches shown above.
 
 Audit endpoints support complete authenticated export through bounded pagination:
 

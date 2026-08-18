@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -7,13 +8,96 @@ import { createOpsServer } from "../dist/app.js";
 
 const temporaryDirectory = mkdtempSync(join(tmpdir(), "ops-console-smoke-"));
 const frontendDirectory = mkdtempSync(join(tmpdir(), "ops-console-frontend-"));
+const bootstrapBundlePath = join(temporaryDirectory, "ops-agent.cjs");
 writeFileSync(join(frontendDirectory, "index.html"), "<!doctype html><html><body><div id=\"root\"></div></body></html>\n");
+writeFileSync(bootstrapBundlePath, "#!/usr/bin/env node\nconsole.log('fake bundled agent');\n");
+
+const hostKeyType = Buffer.from("ssh-ed25519", "ascii");
+const fakeHostKey = Buffer.concat([
+  Buffer.from([0, 0, 0, hostKeyType.length]),
+  hostKeyType,
+  Buffer.alloc(32, 7),
+]);
+const bootstrapUploads = new Map();
+let bootstrapBaseUrl = "";
+let bootstrapAgent;
+
+class FakeSshClient extends EventEmitter {
+  connect(config) {
+    queueMicrotask(() => {
+      try {
+        if (!config.hostVerifier?.(fakeHostKey)) {
+          this.emit("error", new Error("Host denied (verification failed)"));
+        } else if (Array.isArray(config.authHandler) && config.authHandler.includes("none")) {
+          this.emit("error", new Error("All configured authentication methods failed"));
+        } else if (config.password !== "bootstrap smoke password") {
+          this.emit("error", new Error("All configured authentication methods failed"));
+        } else {
+          this.emit("ready");
+        }
+      } catch (error) {
+        this.emit("error", error);
+      }
+    });
+    return this;
+  }
+
+  exec(command, callback) {
+    const stream = new EventEmitter();
+    stream.stderr = new EventEmitter();
+    queueMicrotask(() => {
+      callback(null, stream);
+      if (command === "id -u") stream.emit("data", Buffer.from("0\n"));
+      if (command.includes("for candidate in /opt/server-ops-agent/node")) stream.emit("data", Buffer.from("/usr/bin/node"));
+      if (command.includes("systemctl restart ops-agent.service")) {
+        const envEntry = [...bootstrapUploads.entries()].find(([path]) => path.endsWith(".env"));
+        const configEntry = [...bootstrapUploads.entries()].find(([path]) => path.endsWith(".json"));
+        assert(envEntry && configEntry);
+        const token = envEntry[1].toString("utf8").trim().split("=")[1];
+        const agentConfig = JSON.parse(configEntry[1].toString("utf8"));
+        setTimeout(() => {
+          bootstrapAgent = new WebSocket(`${bootstrapBaseUrl.replace("http://", "ws://")}/api/v1/agent/ws?serverId=${agentConfig.server.id}`, {
+            headers: { authorization: `Bearer ${token}` },
+          });
+          bootstrapAgent.on("error", () => {});
+          bootstrapAgent.once("open", () => bootstrapAgent.send(JSON.stringify({
+            type: "heartbeat",
+            agentVersion: "bootstrap-smoke",
+            metrics: { cpu: 1, memory: 2, disk: 3, load: 0.1 },
+            projects: [],
+          })));
+        }, 5);
+      }
+      stream.emit("close", 0);
+    });
+    return this;
+  }
+
+  sftp(callback) {
+    queueMicrotask(() => callback(null, {
+      writeFile(remotePath, content, _options, done) {
+        bootstrapUploads.set(remotePath, Buffer.from(content));
+        done();
+      },
+    }));
+    return this;
+  }
+
+  end() { queueMicrotask(() => this.emit("close")); return this; }
+  destroy() { queueMicrotask(() => this.emit("close")); return this; }
+}
+
 assert.throws(() => createOpsServer({ dbPath: join(temporaryDirectory, "unauthenticated.sqlite") }), /OPS_ADMIN_TOKEN/);
 const app = createOpsServer({
   dbPath: join(temporaryDirectory, "ops.sqlite"),
   frontendDir: frontendDirectory,
   adminToken: "smoke-admin-token",
+  allowInsecureLocal: true,
   heartbeatTimeoutMs: 2_000,
+  bootstrapTimeoutMs: 10_000,
+  sshReadyTimeoutMs: 1_000,
+  agentBundlePath: bootstrapBundlePath,
+  sshClientFactory: () => new FakeSshClient(),
   logger: { info() {}, warn() {}, error: console.error },
 });
 
@@ -21,6 +105,7 @@ await new Promise((resolveListen) => app.httpServer.listen(0, "127.0.0.1", resol
 const address = app.httpServer.address();
 assert(address && typeof address === "object");
 const baseUrl = `http://127.0.0.1:${address.port}`;
+bootstrapBaseUrl = baseUrl;
 
 async function api(path, options = {}, expectedStatus = 200) {
   const headers = new Headers(options.headers);
@@ -41,6 +126,95 @@ try {
 
   const initialOverview = await api("/api/v1/overview");
   assert.equal(initialOverview.data.servers.total, 0);
+
+  const blockedBootstrap = await api("/api/v1/servers/bootstrap/preflight", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ address: "127.0.0.1", sshPort: 22, sshUsername: "root" }),
+  }, 400);
+  assert.equal(blockedBootstrap.error.code, "BOOTSTRAP_INVALID");
+
+  for (const address of ["::ffff:127.0.0.1", "ff02::1"]) {
+    const blockedIpv6Bootstrap = await api("/api/v1/servers/bootstrap/preflight", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ address, sshPort: 22, sshUsername: "root" }),
+    }, 400);
+    assert.equal(blockedIpv6Bootstrap.error.code, "BOOTSTRAP_INVALID");
+  }
+
+  const bootstrapPreflight = await api("/api/v1/servers/bootstrap/preflight", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ address: "203.0.113.10", sshPort: 2222, sshUsername: "root" }),
+  });
+  assert.equal(bootstrapPreflight.data.hostKeyType, "ssh-ed25519");
+  assert.match(bootstrapPreflight.data.hostKeyFingerprint, /^SHA256:[A-Za-z0-9+/]+$/);
+
+  const mismatchedBootstrap = await api("/api/v1/servers/bootstrap", {
+    method: "POST",
+    headers: { "content-type": "application/json", "idempotency-key": "bootstrap-mismatch-001" },
+    body: JSON.stringify({
+      preflightId: bootstrapPreflight.data.id,
+      address: "203.0.113.10",
+      sshPort: 2222,
+      sshUsername: "root",
+      hostKeyFingerprint: "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      password: "bootstrap smoke password",
+      id: "bootstrap-smoke-server",
+      name: "Bootstrap Smoke Server",
+      controlPlaneUrl: baseUrl,
+    }),
+  }, 409);
+  assert.equal(mismatchedBootstrap.error.code, "SSH_HOST_KEY_MISMATCH");
+
+  const bootstrapStarted = await api("/api/v1/servers/bootstrap", {
+    method: "POST",
+    headers: { "content-type": "application/json", "idempotency-key": "bootstrap-success-001" },
+    body: JSON.stringify({
+      preflightId: bootstrapPreflight.data.id,
+      address: "203.0.113.10",
+      sshPort: 2222,
+      sshUsername: "root",
+      hostKeyFingerprint: bootstrapPreflight.data.hostKeyFingerprint,
+      password: "bootstrap smoke password",
+      id: "bootstrap-smoke-server",
+      name: "Bootstrap Smoke Server",
+      controlPlaneUrl: baseUrl,
+    }),
+  }, 202);
+  assert.equal(bootstrapStarted.data.password, undefined);
+  assert(["queued", "running"].includes(bootstrapStarted.data.status));
+  const bootstrapReplay = await api("/api/v1/servers/bootstrap", {
+    method: "POST",
+    headers: { "content-type": "application/json", "idempotency-key": "bootstrap-success-001" },
+    body: JSON.stringify({
+      preflightId: bootstrapPreflight.data.id,
+      address: "203.0.113.10",
+      sshPort: 2222,
+      sshUsername: "root",
+      hostKeyFingerprint: bootstrapPreflight.data.hostKeyFingerprint,
+      password: "bootstrap smoke password",
+      id: "bootstrap-smoke-server",
+      name: "Bootstrap Smoke Server",
+      controlPlaneUrl: baseUrl,
+    }),
+  });
+  assert.equal(bootstrapReplay.data.id, bootstrapStarted.data.id);
+  assert.equal(bootstrapReplay.idempotentReplay, true);
+  let bootstrapJob;
+  for (let attempt = 0; attempt < 500; attempt += 1) {
+    bootstrapJob = await api(`/api/v1/servers/bootstrap/${bootstrapStarted.data.id}`);
+    if (["succeeded", "failed", "cancelled", "rollback_unknown"].includes(bootstrapJob.data.status)) break;
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 25));
+  }
+  assert.equal(bootstrapJob.data.status, "succeeded", JSON.stringify(bootstrapJob));
+  assert.equal(bootstrapJob.data.stage, "completed");
+  assert.equal(bootstrapJob.data.progress, 100);
+  const uploadedService = [...bootstrapUploads.entries()].find(([path]) => path.endsWith(".service"));
+  assert(uploadedService && uploadedService[1].toString("utf8").includes("ExecStart=/usr/bin/node /opt/server-ops-agent/ops-agent.cjs"));
+  const persistedBootstrapText = JSON.stringify(app.db.sqlite.prepare("SELECT * FROM audit_events").all());
+  assert(!persistedBootstrapText.includes("bootstrap smoke password"));
 
   const enrollment = await api("/api/v1/servers/enrollment-token", {
     method: "POST",
@@ -164,9 +338,10 @@ try {
   await receive((message) => message.type === "heartbeat_ack");
 
   const servers = await api("/api/v1/servers");
-  assert.equal(servers.data[0].health, "warning");
-  assert.equal(servers.data[0].agentConnected, true);
-  assert.equal(servers.data[0].disk, 91.4);
+  const smokeServer = servers.data.find((item) => item.id === "smoke-server");
+  assert.equal(smokeServer.health, "warning");
+  assert.equal(smokeServer.agentConnected, true);
+  assert.equal(smokeServer.disk, 91.4);
 
   let projects = await api("/api/v1/projects");
   assert.equal(projects.data.find((item) => item.id === "smoke-project").version, "abc1234");

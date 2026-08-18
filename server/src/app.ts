@@ -3,6 +3,8 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { randomBytes, randomUUID } from "node:crypto";
 import { extname, resolve, sep } from "node:path";
 import { WebSocketServer, WebSocket, type RawData } from "ws";
+import type { Client } from "ssh2";
+import { BootstrapError, BootstrapManager } from "./bootstrap.js";
 import { OpsDatabase } from "./db.js";
 import { hashToken, parseBearer, redact, tokenMatches } from "./security.js";
 import { taskKinds, type AgentHeartbeat, type AgentMessage, type AgentSession, type Health, type ProjectRow, type ServerRow, type TaskKind, type TaskRow } from "./types.js";
@@ -26,7 +28,7 @@ const mimeTypes: Record<string, string> = {
 };
 
 class HttpError extends Error {
-  constructor(readonly status: number, message: string, readonly details?: unknown) {
+  constructor(readonly status: number, message: string, readonly details?: unknown, readonly code = "request_error") {
     super(message);
   }
 }
@@ -40,6 +42,15 @@ export interface OpsServerOptions {
   heartbeatTimeoutMs?: number;
   maxBodyBytes?: number;
   logger?: Pick<Console, "info" | "warn" | "error">;
+  agentControlPlaneUrl?: string;
+  agentBundlePath?: string;
+  bootstrapMaxConcurrent?: number;
+  bootstrapTimeoutMs?: number;
+  sshReadyTimeoutMs?: number;
+  sshClientFactory?: () => Client;
+  bootstrapAllowPrivateAddresses?: boolean;
+  bootstrapAllowHostnames?: boolean;
+  trustProxy?: boolean;
 }
 
 function sendJson(response: ServerResponse, status: number, body: unknown) {
@@ -63,6 +74,17 @@ function stringField(body: Record<string, unknown>, key: string, required = true
   if (value === undefined && !required) return undefined;
   if (typeof value !== "string" || !value.trim()) throw new HttpError(400, `${key} must be a non-empty string`);
   return value.trim();
+}
+
+function secretField(body: Record<string, unknown>, key: string, maximum = 4096) {
+  const value = body[key];
+  // Password whitespace can be significant, so this validator deliberately
+  // does not trim or normalize the secret.
+  if (typeof value !== "string" || !value || value.length > maximum) {
+    throw new HttpError(400, `${key} must be a non-empty string up to ${maximum} characters`, undefined, "BOOTSTRAP_INVALID");
+  }
+  delete body[key];
+  return value;
 }
 
 function validId(value: string, field = "id") {
@@ -253,6 +275,15 @@ export function createOpsServer(options: OpsServerOptions) {
     if (!token || !tokenMatches(token, hashToken(options.adminToken))) throw new HttpError(401, "Invalid control-plane token");
   };
 
+  const requireSecureBootstrap = (request: IncomingMessage) => {
+    const forwardedProto = String(request.headers["x-forwarded-proto"] ?? "").split(",")[0]?.trim().toLowerCase();
+    const directTls = Boolean((request.socket as IncomingMessage["socket"] & { encrypted?: boolean }).encrypted);
+    const remoteAddress = request.socket.remoteAddress?.replace(/^::ffff:/i, "");
+    const localPeer = remoteAddress === "127.0.0.1" || remoteAddress === "::1";
+    if (directTls || (options.trustProxy === true && forwardedProto === "https") || (options.allowInsecureLocal === true && localPeer)) return;
+    throw new HttpError(400, "SSH bootstrap requires an HTTPS connection", undefined, "BOOTSTRAP_HTTPS_REQUIRED");
+  };
+
   const requireIdempotencyKey = (request: IncomingMessage) => {
     const value = request.headers["idempotency-key"];
     if (typeof value !== "string" || value.trim().length < 8 || value.length > 200) {
@@ -263,6 +294,27 @@ export function createOpsServer(options: OpsServerOptions) {
 
   type AuditInput = Omit<Parameters<OpsDatabase["addAudit"]>[0], "id">;
   const audit = (input: AuditInput) => db.addAudit({ ...input, id: randomUUID() });
+  const bootstrap = new BootstrapManager({
+    db,
+    logger,
+    audit,
+    agentControlPlaneUrl: options.agentControlPlaneUrl,
+    agentBundlePath: options.agentBundlePath,
+    maxConcurrent: options.bootstrapMaxConcurrent,
+    bootstrapTimeoutMs: options.bootstrapTimeoutMs,
+    sshReadyTimeoutMs: options.sshReadyTimeoutMs,
+    sshClientFactory: options.sshClientFactory,
+    allowPrivateAddresses: options.bootstrapAllowPrivateAddresses,
+    allowHostnames: options.bootstrapAllowHostnames,
+    allowInsecureControlPlane: options.allowInsecureLocal === true,
+    onCredentialRotated(serverId) {
+      const session = sessions.get(serverId);
+      if (session) {
+        sessions.delete(serverId);
+        session.socket.close(4003, "Agent credential rotated by SSH bootstrap");
+      }
+    },
+  });
 
   const reconcileOfflineAlerts = () => {
     for (const server of db.listServers()) {
@@ -403,6 +455,9 @@ export function createOpsServer(options: OpsServerOptions) {
 
     if (message.type === "heartbeat") {
       const heartbeat = message as AgentHeartbeat;
+      // A superseded socket may still have queued frames. Ignore them so an
+      // old Agent cannot satisfy a newly rotated bootstrap heartbeat gate.
+      if (sessions.get(serverId)?.socket !== socket) return;
       if (heartbeat.metrics !== undefined && (!heartbeat.metrics || typeof heartbeat.metrics !== "object" || Array.isArray(heartbeat.metrics))) {
         throw new HttpError(400, "heartbeat.metrics must be an object");
       }
@@ -500,7 +555,7 @@ export function createOpsServer(options: OpsServerOptions) {
         }
       }
       for (const project of unreportedProjects) db.resolveAlert(`project-${project.id}-health`);
-      socket.send(JSON.stringify({ type: "heartbeat_ack", timestamp: new Date().toISOString() }));
+      socket.send(JSON.stringify({ type: "heartbeat_ack", timestamp }));
       dispatchForServer(serverId);
       return;
     }
@@ -605,6 +660,7 @@ export function createOpsServer(options: OpsServerOptions) {
     if (method === "POST" && path === "/api/v1/servers/enrollment-token") {
       const body = asObject(await readJson(request, maxBodyBytes));
       const id = validId(stringField(body, "id")!);
+      if (bootstrap.isServerBusy(id)) throw new HttpError(409, "Server is being onboarded; wait for the SSH bootstrap to finish");
       const token = randomBytes(32).toString("base64url");
       const server = db.upsertServer({
         id,
@@ -614,10 +670,72 @@ export function createOpsServer(options: OpsServerOptions) {
         os: stringField(body, "os", false),
         agentTokenHash: hashToken(token),
       });
-      sessions.get(id)?.socket.close(4003, "Agent credential rotated");
+      const previousSession = sessions.get(id);
+      if (previousSession) {
+        sessions.delete(id);
+        previousSession.socket.close(4003, "Agent credential rotated");
+      }
       audit({ action: "server.enrolled", targetType: "server", targetId: id, target: server.name,
         detail: "Agent credential issued or rotated", actor: actorFrom(request) });
       sendJson(response, 201, { data: { server: serializeServer(server), agentToken: token, websocketPath: `/api/v1/agent/ws?serverId=${encodeURIComponent(id)}` } });
+      return;
+    }
+
+    const bootstrapPreflightPaths = new Set(["/api/v1/servers/bootstrap/preflight", "/api/v1/server-bootstrap/preflight"]);
+    const bootstrapPaths = new Set(["/api/v1/servers/bootstrap", "/api/v1/server-bootstrap"]);
+    if (method === "POST" && bootstrapPreflightPaths.has(path)) {
+      const body = asObject(await readJson(request, maxBodyBytes));
+      const result = await bootstrap.preflight({
+        host: body.host ?? body.ip ?? body.address,
+        port: body.port ?? body.sshPort,
+        username: body.username ?? body.sshUsername ?? "root",
+        actor: actorFrom(request),
+      });
+      sendJson(response, 200, { data: result });
+      return;
+    }
+
+    if (method === "GET" && bootstrapPaths.has(path)) {
+      const data = bootstrap.listJobs();
+      sendJson(response, 200, { data, meta: { total: data.length } });
+      return;
+    }
+
+    if (method === "POST" && bootstrapPaths.has(path)) {
+      requireSecureBootstrap(request);
+      const body = asObject(await readJson(request, maxBodyBytes));
+      const password = secretField(body, "password");
+      const rawIdempotencyKey = request.headers["idempotency-key"];
+      const idempotencyKey = rawIdempotencyKey === undefined ? undefined : requireIdempotencyKey(request);
+      const result = bootstrap.start({
+        preflightId: stringField(body, "preflightId")!,
+        host: stringField(body, "host", false) ?? stringField(body, "ip", false) ?? stringField(body, "address")!,
+        port: body.port === undefined ? (body.sshPort === undefined ? 22 : Number(body.sshPort)) : Number(body.port),
+        username: stringField(body, "username", false) ?? stringField(body, "sshUsername", false) ?? "root",
+        hostKeyFingerprint: stringField(body, "hostKeyFingerprint")!,
+        password,
+        serverId: stringField(body, "serverId", false) ?? stringField(body, "id", false),
+        serverName: stringField(body, "serverName", false) ?? stringField(body, "name", false),
+        region: stringField(body, "region", false),
+        os: stringField(body, "os", false),
+        controlPlaneUrl: stringField(body, "controlPlaneUrl", false),
+      }, actorFrom(request), idempotencyKey);
+      sendJson(response, result.existing ? 200 : 202, { data: result.job, idempotentReplay: result.existing });
+      return;
+    }
+
+    let bootstrapMatch = path.match(/^\/api\/v1\/(?:servers\/bootstrap|server-bootstrap)\/([^/]+)\/cancel$/);
+    if (method === "POST" && bootstrapMatch) {
+      const job = bootstrap.cancel(decodeURIComponent(bootstrapMatch[1]!), actorFrom(request));
+      sendJson(response, 200, { data: job });
+      return;
+    }
+
+    bootstrapMatch = path.match(/^\/api\/v1\/(?:servers\/bootstrap|server-bootstrap)\/([^/]+)$/);
+    if (method === "GET" && bootstrapMatch) {
+      const job = bootstrap.getJob(decodeURIComponent(bootstrapMatch[1]!));
+      if (!job) throw new HttpError(404, "Bootstrap job not found", undefined, "BOOTSTRAP_NOT_FOUND");
+      sendJson(response, 200, { data: job });
       return;
     }
 
@@ -865,11 +983,12 @@ export function createOpsServer(options: OpsServerOptions) {
         response.destroy();
         return;
       }
-      const status = error instanceof HttpError ? error.status : 500;
-      const message = error instanceof HttpError ? error.message : "Internal server error";
-      if (!(error instanceof HttpError)) logger.error("Unhandled request error", error);
-      sendJson(response, status, { error: { code: status === 500 ? "internal_error" : "request_error", message,
-        ...(error instanceof HttpError && error.details !== undefined ? { details: error.details } : {}) }, requestId });
+      const expectedError = error instanceof HttpError || error instanceof BootstrapError;
+      const status = expectedError ? error.status : 500;
+      const message = expectedError ? error.message : "Internal server error";
+      if (!expectedError) logger.error("Unhandled request error", error);
+      sendJson(response, status, { error: { code: expectedError ? error.code : "internal_error", message,
+        ...(expectedError && error.details !== undefined ? { details: error.details } : {}) }, requestId });
     }
   });
 
@@ -897,7 +1016,7 @@ export function createOpsServer(options: OpsServerOptions) {
     const serverId = String((request as IncomingMessage & { opsServerId?: string }).opsServerId);
     const existing = sessions.get(serverId);
     if (existing) existing.socket.close(4001, "Superseded by a new Agent connection");
-    sessions.set(serverId, { serverId, connectedAt: new Date().toISOString(), socket });
+    sessions.set(serverId, { serverId, sessionId: randomUUID(), connectedAt: new Date().toISOString(), socket });
     socket.send(JSON.stringify({ type: "hello_ack", serverId, serverTime: new Date().toISOString(), heartbeatIntervalSeconds: 15 }));
     recoverAgentTasks(serverId);
     dispatchForServer(serverId);
@@ -929,8 +1048,9 @@ export function createOpsServer(options: OpsServerOptions) {
       new Promise<void>((resolveClose, reject) => httpServer.close((error) => error ? reject(error) : resolveClose())),
       new Promise<void>((resolveClose) => wss.close(() => resolveClose())),
     ]);
+    await bootstrap.close();
     db.close();
   };
 
-  return { httpServer, db, sessions, close };
+  return { httpServer, db, sessions, bootstrap, close };
 }
