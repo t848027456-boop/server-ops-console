@@ -137,11 +137,23 @@ export interface BootstrapPreflight {
 export interface BootstrapJob {
   jobId: string;
   status: string;
+  serverId?: string | null;
+  host?: string | null;
+  port?: number | null;
+  username?: string | null;
+  hostKeyFingerprint?: string | null;
+  hostKeyType?: string | null;
   stage?: string | null;
   progress?: number | null;
   errorCode?: string | null;
   rollbackState?: string | null;
   message?: string | null;
+  cancelRequested?: boolean;
+  rollbackAttempted?: boolean;
+  heartbeatAt?: string | null;
+  startedAt?: string | null;
+  remoteStateUncertain?: boolean;
+  recoveryRequired?: boolean;
   createdAt?: string | null;
   updatedAt?: string | null;
   finishedAt?: string | null;

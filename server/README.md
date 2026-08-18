@@ -58,6 +58,8 @@ POST /api/v1/servers/bootstrap
 GET  /api/v1/servers/bootstrap
 GET  /api/v1/servers/bootstrap/:jobId
 POST /api/v1/servers/bootstrap/:jobId/cancel
+GET  /api/v1/servers/bootstrap/recovery
+POST /api/v1/servers/bootstrap/recovery/:serverId/resolve
 GET  /api/v1/servers/:id
 POST /api/v1/servers/:id/refresh
 
@@ -83,11 +85,11 @@ GET  /api/v1/audit-events
 
 SSH bootstrap is a short-lived installation path, not a long-term password store. First call `POST /api/v1/servers/bootstrap/preflight` with `address`, optional `sshPort`, and optional `sshUsername`. The response contains an OpenSSH-style `SHA256:` host-key fingerprint, key type, and an expiring `preflightId`. Show that fingerprint to the operator before requesting a password.
 
-After confirmation, call `POST /api/v1/servers/bootstrap` with the same target, `preflightId`, `hostKeyFingerprint`, server `id`/`name`, and `password`. The password is removed from the parsed request immediately and is never written to SQLite, audit events, job state, logs, URLs, environment variables, or command arguments. The worker uploads the bundled Agent, a token-only environment file, its config, and a fixed systemd unit; success requires a fresh Agent heartbeat from the new Agent session.
+After confirmation, call `POST /api/v1/servers/bootstrap` with the same target, `preflightId`, `hostKeyFingerprint`, server `id`/`name`, and `password`, plus a required unique `Idempotency-Key` header (8-200 characters). The password is removed from the parsed request immediately and is never written to SQLite, audit events, job state, logs, URLs, environment variables, or command arguments. The worker uploads the bundled Agent, a token-only environment file, its config, and a fixed systemd unit; success requires a fresh Agent heartbeat from the new Agent session.
 
 Production bootstrap requires a `wss://` control-plane URL. Set `OPS_AGENT_CONTROL_PLANE_URL` on the server and set `OPS_TRUST_PROXY=1` only when a trusted TLS reverse proxy terminates HTTPS and forwards `X-Forwarded-Proto`. `OPS_ALLOW_INSECURE_LOCAL=1` is limited to a loopback development process.
 
-Bootstrap job and preflight metadata are persisted in SQLite without the SSH password. Jobs expose `stage`, `progress`, fixed `errorCode` values, cancellation, and `rollback_unknown` when a remote rollback cannot be verified. A preflight token is single-use and expires after ten minutes. If the control plane restarts while a bootstrap is queued or running, it marks the job `rollback_unknown` with `stage: recovery_required`, keeps the idempotency record, and raises a critical alert; it never retries the password or remote operation automatically. Verify the target host before starting another installation. By default the SSH target must be a public IP literal; loopback, link-local/cloud-metadata, carrier-grade NAT, multicast, private addresses, and hostnames are rejected. Private addresses and hostnames require the explicit environment switches shown above.
+Bootstrap job and preflight metadata are persisted in SQLite without the SSH password. Jobs expose `stage`, `progress`, fixed `errorCode` values, cancellation, and `rollback_unknown` when a remote rollback cannot be verified. A preflight token is single-use and expires after ten minutes. If the control plane restarts while a bootstrap is queued or running, it marks the job `rollback_unknown` with `stage: recovery_required`, persists a server-level recovery lock, keeps the idempotency record, and raises a critical alert; every new bootstrap key for that server or host/port is rejected until an operator verifies the remote state. Existing idempotent replays remain read-only. List locks with `GET /api/v1/servers/bootstrap/recovery`, then resolve one with `POST /api/v1/servers/bootstrap/recovery/:serverId/resolve` and JSON `{ "bootstrapJobId": "...", "confirmation": "I_HAVE_VERIFIED_REMOTE_STATE" }`; the audit record is committed before the lock is cleared. Verify the target host before starting another installation. By default the SSH target must be a public IP literal; loopback, link-local/cloud-metadata, carrier-grade NAT, multicast, private addresses, and hostnames are rejected. Private addresses and hostnames require the explicit environment switches shown above.
 
 Audit endpoints support complete authenticated export through bounded pagination:
 

@@ -49,6 +49,78 @@ function idempotencyHeaders() {
   return { "Idempotency-Key": crypto.randomUUID() };
 }
 
+const BOOTSTRAP_FLOW_STORAGE_KEY = "ops-bootstrap-flows-v1";
+const BOOTSTRAP_FLOW_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+const BOOTSTRAP_FLOW_LIMIT = 100;
+let inMemoryBootstrapFlows: BootstrapFlowRecord[] = [];
+
+interface BootstrapFlowRecord {
+  preflightId: string;
+  idempotencyKey: string;
+  jobId?: string;
+  serverId?: string;
+  host?: string;
+  updatedAt: string;
+}
+
+function readBootstrapFlows() {
+  try {
+    const raw = window.sessionStorage.getItem(BOOTSTRAP_FLOW_STORAGE_KEY);
+    const parsed = raw ? JSON.parse(raw) : [];
+    if (!Array.isArray(parsed)) return [] as BootstrapFlowRecord[];
+    const records = parsed.filter((item): item is BootstrapFlowRecord => Boolean(item && typeof item === "object"
+      && typeof item.preflightId === "string" && typeof item.idempotencyKey === "string"));
+    inMemoryBootstrapFlows = records;
+    return records;
+  } catch {
+    return inMemoryBootstrapFlows;
+  }
+}
+
+function writeBootstrapFlows(records: BootstrapFlowRecord[]) {
+  inMemoryBootstrapFlows = records;
+  try { window.sessionStorage.setItem(BOOTSTRAP_FLOW_STORAGE_KEY, JSON.stringify(records)); } catch { /* private browsing can reject storage */ }
+}
+
+function pruneBootstrapFlows(records: BootstrapFlowRecord[]) {
+  const cutoff = Date.now() - BOOTSTRAP_FLOW_RETENTION_MS;
+  return records
+    .filter((record) => Date.parse(record.updatedAt) >= cutoff)
+    .sort((left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt))
+    .slice(0, BOOTSTRAP_FLOW_LIMIT);
+}
+
+export function ensureBootstrapFlow(preflightId: string, details: Pick<BootstrapFlowRecord, "host"> = {}) {
+  const records = pruneBootstrapFlows(readBootstrapFlows());
+  const existing = records.find((record) => record.preflightId === preflightId);
+  if (existing) {
+    existing.updatedAt = new Date().toISOString();
+    if (details.host) existing.host = details.host;
+    writeBootstrapFlows(records);
+    return existing;
+  }
+  const record: BootstrapFlowRecord = {
+    preflightId,
+    idempotencyKey: crypto.randomUUID(),
+    host: details.host,
+    updatedAt: new Date().toISOString(),
+  };
+  writeBootstrapFlows(pruneBootstrapFlows([record, ...records]));
+  return record;
+}
+
+export function rememberBootstrapJob(preflightId: string, job: Pick<BootstrapJob, "jobId" | "serverId" | "host">) {
+  const record = ensureBootstrapFlow(preflightId, { host: job.host ?? undefined });
+  const records = pruneBootstrapFlows(readBootstrapFlows());
+  const current = records.find((item) => item.preflightId === preflightId) ?? record;
+  current.jobId = job.jobId;
+  if (job.serverId) current.serverId = job.serverId;
+  if (job.host) current.host = job.host;
+  current.updatedAt = new Date().toISOString();
+  writeBootstrapFlows(pruneBootstrapFlows([current, ...records.filter((item) => item.preflightId !== preflightId)]));
+  return current;
+}
+
 let bootstrapJobRoute: "planned" | "server" = "planned";
 
 function objectValue(value: unknown): Record<string, unknown> {
@@ -91,11 +163,23 @@ function normalizeBootstrapJob(value: BootstrapJob): BootstrapJob {
   return {
     jobId: stringValue(source.jobId || source.id),
     status: stringValue(source.status) || "unknown",
+    serverId: stringValue(source.serverId || source.server_id) || null,
+    host: stringValue(source.host) || null,
+    port: typeof source.port === "number" ? source.port : null,
+    username: stringValue(source.username) || null,
+    hostKeyFingerprint: stringValue(source.hostKeyFingerprint || source.host_key_fingerprint) || null,
+    hostKeyType: stringValue(source.hostKeyType || source.host_key_type) || null,
     stage: stringValue(source.stage || source.phase) || null,
     progress: typeof source.progress === "number" ? source.progress : null,
     errorCode: stringValue(source.errorCode || source.error_code) || null,
     rollbackState: stringValue(source.rollbackState || source.rollback_state) || (source.rollbackAttempted === true ? (source.status === "rollback_unknown" ? "unknown" : "attempted") : null),
     message: stringValue(source.message || source.error) || null,
+    cancelRequested: source.cancelRequested === true || source.cancel_requested === 1,
+    rollbackAttempted: source.rollbackAttempted === true || source.rollback_attempted === 1,
+    heartbeatAt: stringValue(source.heartbeatAt || source.heartbeat_at) || null,
+    startedAt: stringValue(source.startedAt || source.started_at) || null,
+    remoteStateUncertain: source.remoteStateUncertain === true || source.remote_state_uncertain === 1,
+    recoveryRequired: source.recoveryRequired === true || source.recovery_required === 1,
     createdAt: stringValue(source.createdAt || source.created_at) || null,
     updatedAt: stringValue(source.updatedAt || source.updated_at) || null,
     finishedAt: stringValue(source.finishedAt || source.finished_at) || null,
@@ -158,11 +242,19 @@ export const api = {
     method: "POST",
     body: JSON.stringify({ address: input.address, sshPort: input.sshPort, sshUsername: input.sshUsername }),
   })),
-  bootstrap: async (input: { preflightId: string; id: string; name: string; region?: string; address: string; sshPort: number; sshUsername: string; password: string; hostKeyFingerprint: string; controlPlaneUrl: string }) => normalizeBootstrapJob(await request<BootstrapJob>("/servers/bootstrap", {
+  bootstrap: async (input: { preflightId: string; id: string; name: string; region?: string; address: string; sshPort: number; sshUsername: string; password: string; hostKeyFingerprint: string; controlPlaneUrl: string; idempotencyKey: string }) => normalizeBootstrapJob(await request<BootstrapJob>("/servers/bootstrap", {
     method: "POST",
-    headers: idempotencyHeaders(),
+    headers: { "Idempotency-Key": input.idempotencyKey },
     body: JSON.stringify({ preflightId: input.preflightId, id: input.id, name: input.name, region: input.region, address: input.address, sshPort: input.sshPort, sshUsername: input.sshUsername, password: input.password, hostKeyFingerprint: input.hostKeyFingerprint, controlPlaneUrl: input.controlPlaneUrl }),
   })),
+  bootstrapJobs: async () => {
+    const jobs = await request<BootstrapJob[]>("/servers/bootstrap");
+    return Array.isArray(jobs) ? jobs.map(normalizeBootstrapJob) : [];
+  },
+  resolveBootstrapRecovery: (serverId: string, bootstrapJobId: string) => request(`/servers/bootstrap/recovery/${encodeURIComponent(serverId)}/resolve`, {
+    method: "POST",
+    body: JSON.stringify({ bootstrapJobId, confirmation: "I_HAVE_VERIFIED_REMOTE_STATE" }),
+  }),
   bootstrapJob: async (jobId: string) => {
     const encoded = encodeURIComponent(jobId);
     if (bootstrapJobRoute === "server") return normalizeBootstrapJob(await request<BootstrapJob>(`/servers/bootstrap/${encoded}`));

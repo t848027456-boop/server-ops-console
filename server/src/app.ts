@@ -286,8 +286,11 @@ export function createOpsServer(options: OpsServerOptions) {
 
   const requireIdempotencyKey = (request: IncomingMessage) => {
     const value = request.headers["idempotency-key"];
+    if (value === undefined) {
+      throw new HttpError(400, "Idempotency-Key header is required", undefined, "IDEMPOTENCY_KEY_REQUIRED");
+    }
     if (typeof value !== "string" || value.trim().length < 8 || value.length > 200) {
-      throw new HttpError(400, "Idempotency-Key header must contain 8-200 characters");
+      throw new HttpError(400, "Idempotency-Key header must contain 8-200 characters", undefined, "IDEMPOTENCY_KEY_INVALID");
     }
     return value.trim();
   };
@@ -703,10 +706,9 @@ export function createOpsServer(options: OpsServerOptions) {
 
     if (method === "POST" && bootstrapPaths.has(path)) {
       requireSecureBootstrap(request);
+      const idempotencyKey = requireIdempotencyKey(request);
       const body = asObject(await readJson(request, maxBodyBytes));
       const password = secretField(body, "password");
-      const rawIdempotencyKey = request.headers["idempotency-key"];
-      const idempotencyKey = rawIdempotencyKey === undefined ? undefined : requireIdempotencyKey(request);
       const result = bootstrap.start({
         preflightId: stringField(body, "preflightId")!,
         host: stringField(body, "host", false) ?? stringField(body, "ip", false) ?? stringField(body, "address")!,
@@ -721,6 +723,24 @@ export function createOpsServer(options: OpsServerOptions) {
         controlPlaneUrl: stringField(body, "controlPlaneUrl", false),
       }, actorFrom(request), idempotencyKey);
       sendJson(response, result.existing ? 200 : 202, { data: result.job, idempotentReplay: result.existing });
+      return;
+    }
+
+    const recoveryListPaths = new Set(["/api/v1/servers/bootstrap/recovery", "/api/v1/server-bootstrap/recovery"]);
+    if (method === "GET" && recoveryListPaths.has(path)) {
+      const data = bootstrap.listRecoveryLocks();
+      sendJson(response, 200, { data, meta: { total: data.length } });
+      return;
+    }
+
+    const recoveryMatch = path.match(/^\/api\/v1\/(?:servers\/bootstrap|server-bootstrap)\/recovery\/([^/]+)\/(?:resolve|acknowledge)$/);
+    if (method === "POST" && recoveryMatch) {
+      const body = asObject(await readJson(request, maxBodyBytes));
+      const confirmation = stringField(body, "confirmation")!;
+      const bootstrapJobId = stringField(body, "bootstrapJobId")!;
+      const result = bootstrap.resolveRecovery(decodeURIComponent(recoveryMatch[1]!), bootstrapJobId,
+        actorFrom(request), confirmation);
+      sendJson(response, 200, { data: result });
       return;
     }
 

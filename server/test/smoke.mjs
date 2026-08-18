@@ -154,6 +154,38 @@ try {
   assert.equal(bootstrapPreflight.data.hostKeyType, "ssh-ed25519");
   assert.match(bootstrapPreflight.data.hostKeyFingerprint, /^SHA256:[A-Za-z0-9+/]+$/);
 
+  const missingBootstrapIdempotency = await api("/api/v1/servers/bootstrap", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      preflightId: bootstrapPreflight.data.id,
+      address: "203.0.113.10",
+      sshPort: 2222,
+      sshUsername: "root",
+      hostKeyFingerprint: bootstrapPreflight.data.hostKeyFingerprint,
+      password: "bootstrap smoke password",
+      id: "bootstrap-smoke-server",
+      controlPlaneUrl: baseUrl,
+    }),
+  }, 400);
+  assert.equal(missingBootstrapIdempotency.error.code, "IDEMPOTENCY_KEY_REQUIRED");
+
+  const invalidBootstrapIdempotency = await api("/api/v1/servers/bootstrap", {
+    method: "POST",
+    headers: { "content-type": "application/json", "idempotency-key": "short" },
+    body: JSON.stringify({
+      preflightId: bootstrapPreflight.data.id,
+      address: "203.0.113.10",
+      sshPort: 2222,
+      sshUsername: "root",
+      hostKeyFingerprint: bootstrapPreflight.data.hostKeyFingerprint,
+      password: "bootstrap smoke password",
+      id: "bootstrap-smoke-server",
+      controlPlaneUrl: baseUrl,
+    }),
+  }, 400);
+  assert.equal(invalidBootstrapIdempotency.error.code, "IDEMPOTENCY_KEY_INVALID");
+
   const mismatchedBootstrap = await api("/api/v1/servers/bootstrap", {
     method: "POST",
     headers: { "content-type": "application/json", "idempotency-key": "bootstrap-mismatch-001" },
@@ -618,7 +650,65 @@ try {
   assert.equal(recoveredBootstrap.status, "rollback_unknown");
   assert.equal(recoveredBootstrap.stage, "recovery_required");
   assert.equal(recoveredBootstrap.errorCode, "BOOTSTRAP_ROLLBACK_UNKNOWN");
+  assert.equal(recoveredBootstrap.remoteStateUncertain, true);
+  assert.equal(recoveredBootstrap.recoveryRequired, true);
   assert(recoveredBootstrap.finishedAt);
+
+  const recoveryLocks = await api("/api/v1/servers/bootstrap/recovery");
+  const recoveryLock = recoveryLocks.data.find((item) => item.serverId === "bootstrap-recovery-server");
+  assert(recoveryLock);
+  assert.equal(recoveryLock.bootstrapJobId, "bootstrap-recovery-smoke");
+
+  const blockedByRecoveryLock = await api("/api/v1/servers/bootstrap", {
+    method: "POST",
+    headers: { "content-type": "application/json", "idempotency-key": "bootstrap-recovery-new-key" },
+    body: JSON.stringify({
+      preflightId: restartPreflight.data.id,
+      address: "203.0.113.11",
+      sshPort: 2222,
+      sshUsername: "root",
+      hostKeyFingerprint: restartPreflight.data.hostKeyFingerprint,
+      password: "bootstrap smoke password",
+      id: "bootstrap-recovery-server",
+      controlPlaneUrl: baseUrl,
+    }),
+  }, 409);
+  assert.equal(blockedByRecoveryLock.error.code, "BOOTSTRAP_RECOVERY_REQUIRED");
+
+  const blockedByRecoveryTarget = await api("/api/v1/servers/bootstrap", {
+    method: "POST",
+    headers: { "content-type": "application/json", "idempotency-key": "bootstrap-recovery-other-server" },
+    body: JSON.stringify({
+      preflightId: restartPreflight.data.id,
+      address: "203.0.113.11",
+      sshPort: 2222,
+      sshUsername: "root",
+      hostKeyFingerprint: restartPreflight.data.hostKeyFingerprint,
+      password: "bootstrap smoke password",
+      id: "different-server-id",
+      controlPlaneUrl: baseUrl,
+    }),
+  }, 409);
+  assert.equal(blockedByRecoveryTarget.error.code, "BOOTSTRAP_RECOVERY_REQUIRED");
+
+  const wrongRecoveryConfirmation = await api("/api/v1/servers/bootstrap/recovery/bootstrap-recovery-server/resolve", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ bootstrapJobId: "bootstrap-recovery-smoke", confirmation: "no" }),
+  }, 400);
+  assert.equal(wrongRecoveryConfirmation.error.code, "BOOTSTRAP_RECOVERY_CONFIRMATION_REQUIRED");
+
+  const resolvedRecovery = await api("/api/v1/servers/bootstrap/recovery/bootstrap-recovery-server/resolve", {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-ops-actor": "recovery-operator" },
+    body: JSON.stringify({ bootstrapJobId: "bootstrap-recovery-smoke", confirmation: "I_HAVE_VERIFIED_REMOTE_STATE" }),
+  });
+  assert.equal(resolvedRecovery.data.serverId, "bootstrap-recovery-server");
+  assert.equal((await api("/api/v1/servers/bootstrap/recovery")).data.some((item) => item.serverId === "bootstrap-recovery-server"), false);
+  const resolvedRecoveryJob = await api("/api/v1/servers/bootstrap/bootstrap-recovery-smoke");
+  assert.equal(resolvedRecoveryJob.data.stage, "recovery_resolved");
+  assert.equal(resolvedRecoveryJob.data.remoteStateUncertain, false);
+  assert.equal(resolvedRecoveryJob.data.recoveryRequired, false);
 
   const recoveredReplay = await api("/api/v1/servers/bootstrap", {
     method: "POST",

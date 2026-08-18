@@ -4,7 +4,7 @@ import { lookup } from "node:dns/promises";
 import { BlockList, isIP } from "node:net";
 import { resolve } from "node:path";
 import { Client, type ClientChannel, type ConnectConfig } from "ssh2";
-import type { BootstrapJobRow, BootstrapPreflightRow, OpsDatabase } from "./db.js";
+import type { BootstrapJobRow, BootstrapPreflightRow, BootstrapRecoveryLockRow, OpsDatabase } from "./db.js";
 import { hashToken, redact } from "./security.js";
 
 /**
@@ -29,6 +29,11 @@ export type BootstrapErrorCode =
   | "BOOTSTRAP_BUSY"
   | "BOOTSTRAP_NOT_FOUND"
   | "BOOTSTRAP_EXPIRED"
+  | "BOOTSTRAP_RECOVERY_REQUIRED"
+  | "BOOTSTRAP_RECOVERY_NOT_FOUND"
+  | "BOOTSTRAP_RECOVERY_MISMATCH"
+  | "BOOTSTRAP_RECOVERY_CONFIRMATION_REQUIRED"
+  | "BOOTSTRAP_STORAGE_FAILED"
   | "SSH_HOST_UNREACHABLE"
   | "SSH_CONNECTION_REFUSED"
   | "SSH_TIMEOUT"
@@ -76,6 +81,18 @@ export interface BootstrapJobView {
   error: string | null;
   rollbackAttempted: boolean;
   heartbeatAt: string | null;
+  remoteStateUncertain: boolean;
+  recoveryRequired: boolean;
+}
+
+export interface BootstrapRecoveryLockView {
+  serverId: string;
+  bootstrapJobId: string;
+  host: string;
+  port: number;
+  reason: string;
+  createdAt: string;
+  updatedAt: string;
 }
 
 interface BootstrapJob extends BootstrapJobView {
@@ -158,6 +175,7 @@ const AGENT_REMOTE_DIR = "/opt/server-ops-agent";
 const AGENT_CONFIG_DIR = "/etc/server-ops-agent";
 const AGENT_STATE_DIR = "/var/lib/server-ops-agent";
 const AGENT_SERVICE = "ops-agent.service";
+export const BOOTSTRAP_RECOVERY_CONFIRMATION = "I_HAVE_VERIFIED_REMOTE_STATE";
 
 // Reject IPv6 ranges that are not routable server targets or that can tunnel
 // back into local IPv4/private networks. IPv4-mapped addresses are blocked
@@ -633,6 +651,7 @@ export class BootstrapManager {
   private readonly preflights = new Map<string, PreflightRecord>();
   private readonly jobs = new Map<string, BootstrapJob>();
   private readonly idempotency = new Map<string, { id: string; target: string; fingerprint: string; serverId: string }>();
+  private readonly recoveryLocks = new Map<string, BootstrapRecoveryLockRow>();
   private readonly workers = new Set<Promise<void>>();
   private activeCount = 0;
   private preflightCount = 0;
@@ -680,6 +699,11 @@ export class BootstrapManager {
           serverId: job.serverId,
         });
       }
+    }
+    for (const row of this.db.listBootstrapRecoveryLocks()) {
+      this.recoveryLocks.set(row.server_id, row);
+      const job = this.jobs.get(row.bootstrap_job_id);
+      if (job) job.recoveryRequired = true;
     }
     for (const row of recovered) {
       try {
@@ -741,6 +765,7 @@ export class BootstrapManager {
       cancelRequestedInternal: Boolean(row.cancel_requested),
       transportError: null,
       remoteStateUncertain: Boolean(row.remote_state_uncertain),
+      recoveryRequired: row.stage === "recovery_required" && Boolean(row.remote_state_uncertain),
       serverMetadataTouched: Boolean(row.server_metadata_touched),
       installedAgentTokenHash: row.installed_agent_token_hash,
       idempotencyKey: row.idempotency_key,
@@ -782,6 +807,92 @@ export class BootstrapManager {
     });
   }
 
+  private tryPersist(job: BootstrapJob, phase = job.stage) {
+    try {
+      this.persist(job);
+      return true;
+    } catch (error) {
+      this.logger.error(`Could not persist SSH bootstrap ${job.id} state during ${phase}`, error);
+      return false;
+    }
+  }
+
+  private requirePersist(job: BootstrapJob, phase = job.stage) {
+    if (!this.tryPersist(job, phase)) {
+      throw new BootstrapError("BOOTSTRAP_STORAGE_FAILED",
+        "Control-plane state could not be persisted; the SSH bootstrap was stopped", 503);
+    }
+  }
+
+  private tryAudit(input: BootstrapAuditInput) {
+    try {
+      this.audit(input);
+      return true;
+    } catch (error) {
+      this.logger.error(`Could not persist SSH bootstrap audit ${input.action}`, error);
+      return false;
+    }
+  }
+
+  private recoveryLockView(row: BootstrapRecoveryLockRow): BootstrapRecoveryLockView {
+    return {
+      serverId: row.server_id,
+      bootstrapJobId: row.bootstrap_job_id,
+      host: row.host,
+      port: Number(row.port),
+      reason: row.reason,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    };
+  }
+
+  private findRecoveryLock(serverId: string | undefined, host: string, connectHost: string, port: number) {
+    const persistedServerLock = serverId ? this.db.getBootstrapRecoveryLock(serverId) : undefined;
+    if (persistedServerLock) this.recoveryLocks.set(persistedServerLock.server_id, persistedServerLock);
+    const serverLock = serverId ? this.recoveryLocks.get(serverId) : undefined;
+    if (serverLock) return serverLock;
+    let targetLock = [...this.recoveryLocks.values()].find((row) => Number(row.port) === port
+      && (row.host === host || row.connect_host === connectHost));
+    if (targetLock) return targetLock;
+    targetLock = this.db.listBootstrapRecoveryLocks().find((row) => Number(row.port) === port
+      && (row.host === host || row.connect_host === connectHost));
+    if (targetLock) this.recoveryLocks.set(targetLock.server_id, targetLock);
+    return targetLock;
+  }
+
+  private persistRecoveryRequired(job: BootstrapJob, reason: string) {
+    const now = isoNow();
+    job.remoteStateUncertain = true;
+    job.recoveryRequired = true;
+    const lock: BootstrapRecoveryLockRow = {
+      server_id: job.serverId,
+      bootstrap_job_id: job.id,
+      host: job.host,
+      connect_host: job.connectHost,
+      port: job.port,
+      reason,
+      created_at: now,
+      updated_at: now,
+      cleared_at: null,
+      cleared_by: null,
+    };
+    this.recoveryLocks.set(job.serverId, lock);
+    try {
+      this.db.transaction(() => {
+        this.persist(job);
+        lock.updated_at = job.updatedAt;
+        this.db.upsertBootstrapRecoveryLock(lock);
+      });
+    } catch (error) {
+      this.logger.error(`Could not atomically persist SSH bootstrap recovery lock for ${job.id}`, error);
+      // A job-state write and lock write fail independently. Persisting either
+      // one is enough for the next startup to conservatively reconstruct the
+      // recovery requirement.
+      try { this.db.upsertBootstrapRecoveryLock(lock); }
+      catch (lockError) { this.logger.error(`Could not persist SSH bootstrap recovery lock for ${job.id}`, lockError); }
+    }
+  }
+
   private cleanup() {
     const now = Date.now();
     for (const [id, preflight] of this.preflights) {
@@ -792,7 +903,8 @@ export class BootstrapManager {
     }
     const cutoff = new Date(now - BOOTSTRAP_JOB_RETENTION_MS).toISOString();
     for (const [id, job] of this.jobs) {
-      if (job.finishedAt && Date.parse(job.finishedAt) <= Date.parse(cutoff)) {
+      if (job.finishedAt && !job.remoteStateUncertain && !job.recoveryRequired
+        && job.stage !== "recovery_required" && Date.parse(job.finishedAt) <= Date.parse(cutoff)) {
         this.jobs.delete(id);
         if (job.idempotencyKey) this.idempotency.delete(job.idempotencyKey);
       }
@@ -821,6 +933,8 @@ export class BootstrapManager {
       error: job.error,
       rollbackAttempted: job.rollbackAttempted,
       heartbeatAt: job.heartbeatAt,
+      remoteStateUncertain: job.remoteStateUncertain,
+      recoveryRequired: job.recoveryRequired,
     };
   }
 
@@ -829,11 +943,69 @@ export class BootstrapManager {
   }
 
   isServerBusy(serverId: string) {
-    return [...this.jobs.values()].some((job) => !job.finishedAt && job.serverId === serverId);
+    const persistedLock = this.db.getBootstrapRecoveryLock(serverId);
+    if (persistedLock) this.recoveryLocks.set(serverId, persistedLock);
+    return this.recoveryLocks.has(serverId)
+      || [...this.jobs.values()].some((job) => !job.finishedAt && job.serverId === serverId);
   }
 
   listJobs() {
     return [...this.jobs.values()].sort((left, right) => right.createdAt.localeCompare(left.createdAt)).map((job) => this.view(job));
+  }
+
+  listRecoveryLocks() {
+    return [...this.recoveryLocks.values()]
+      .sort((left, right) => right.created_at.localeCompare(left.created_at))
+      .map((row) => this.recoveryLockView(row));
+  }
+
+  resolveRecovery(serverIdInput: string, bootstrapJobIdInput: string, actor: string, confirmation: string) {
+    const serverId = safeId(serverIdInput, "serverId");
+    const bootstrapJobId = safeId(bootstrapJobIdInput, "bootstrapJobId");
+    if (confirmation !== BOOTSTRAP_RECOVERY_CONFIRMATION) {
+      throw new BootstrapError("BOOTSTRAP_RECOVERY_CONFIRMATION_REQUIRED",
+        `confirmation must be ${BOOTSTRAP_RECOVERY_CONFIRMATION}`, 400);
+    }
+    const persistedLock = this.db.getBootstrapRecoveryLock(serverId);
+    if (persistedLock) this.recoveryLocks.set(serverId, persistedLock);
+    const lock = this.recoveryLocks.get(serverId);
+    if (!lock) throw new BootstrapError("BOOTSTRAP_RECOVERY_NOT_FOUND", "No active SSH bootstrap recovery lock exists for this server", 404);
+    if (lock.bootstrap_job_id !== bootstrapJobId) {
+      throw new BootstrapError("BOOTSTRAP_RECOVERY_MISMATCH", "Recovery lock belongs to a different bootstrap job", 409,
+        { bootstrapJobId: lock.bootstrap_job_id });
+    }
+    const job = this.jobs.get(bootstrapJobId);
+    const now = isoNow();
+    this.db.transaction(() => {
+      // The audit record is written before the lock is cleared, in the same
+      // transaction, so an audit failure leaves the safety lock intact.
+      this.audit({
+        action: "server.bootstrap.recovery_resolved",
+        targetType: "server",
+        targetId: serverId,
+        target: lock.host,
+        detail: "Operator confirmed remote SSH bootstrap state and cleared the recovery lock",
+        actor,
+        correlationId: bootstrapJobId,
+        metadata: { host: lock.host, port: lock.port, reason: lock.reason },
+      });
+      if (!this.db.resolveBootstrapRecoveryLock(serverId, bootstrapJobId, actor, now)) {
+        throw new BootstrapError("BOOTSTRAP_RECOVERY_NOT_FOUND", "SSH bootstrap recovery lock is no longer active", 409);
+      }
+      this.db.resolveAlert(`bootstrap-recovery-${bootstrapJobId}`);
+    });
+    this.recoveryLocks.delete(serverId);
+    if (job) {
+      job.stage = "recovery_resolved";
+      job.remoteStateUncertain = false;
+      job.recoveryRequired = false;
+      job.updatedAt = now;
+    }
+    return { ...this.recoveryLockView(lock), resolvedAt: now, resolvedBy: actor };
+  }
+
+  acknowledgeRecovery(serverIdInput: string, bootstrapJobIdInput: string, actor: string, confirmation: string) {
+    return this.resolveRecovery(serverIdInput, bootstrapJobIdInput, actor, confirmation);
   }
 
   async preflight(input: { host: unknown; port?: unknown; username?: unknown; actor: string }) {
@@ -904,8 +1076,12 @@ export class BootstrapManager {
     }
   }
 
-  start(input: BootstrapInput, actor: string, idempotencyKey?: string) {
+  start(input: BootstrapInput, actor: string, idempotencyKey: string) {
     if (this.closing) throw new BootstrapError("BOOTSTRAP_BUSY", "Bootstrap service is shutting down", 503);
+    if (typeof idempotencyKey !== "string" || idempotencyKey.trim().length < 8 || idempotencyKey.length > 200) {
+      throw new BootstrapError("BOOTSTRAP_INVALID", "Idempotency-Key is required and must contain 8-200 characters", 400);
+    }
+    idempotencyKey = idempotencyKey.trim();
     const preflightId = safeId(input.preflightId, "preflightId");
     const host = safeHost(input.host, this.allowPrivateAddresses, this.allowHostnames);
     const port = safePort(input.port);
@@ -915,38 +1091,36 @@ export class BootstrapManager {
       throw new BootstrapError("BOOTSTRAP_INVALID", "password is required and must be at most 4096 characters", 400);
     }
     const requestedServerId = input.serverId ? safeId(input.serverId, "serverId") : undefined;
-    if (idempotencyKey) {
-      let existingId = this.idempotency.get(idempotencyKey);
-      if (!existingId) {
-        const persisted = this.db.getBootstrapJobByIdempotencyKey(idempotencyKey);
-        if (persisted) {
-          const restored = this.fromRow(persisted);
-          this.jobs.set(restored.id, restored);
-          existingId = {
-            id: restored.id,
-            target: `${restored.host}:${restored.port}:${restored.username}`,
-            fingerprint: restored.hostKeyFingerprint,
-            serverId: restored.serverId,
-          };
-          this.idempotency.set(idempotencyKey, existingId);
-        }
+    let existingId = this.idempotency.get(idempotencyKey);
+    if (!existingId) {
+      const persisted = this.db.getBootstrapJobByIdempotencyKey(idempotencyKey);
+      if (persisted) {
+        const restored = this.fromRow(persisted);
+        this.jobs.set(restored.id, restored);
+        existingId = {
+          id: restored.id,
+          target: `${restored.host}:${restored.port}:${restored.username}`,
+          fingerprint: restored.hostKeyFingerprint,
+          serverId: restored.serverId,
+        };
+        this.idempotency.set(idempotencyKey, existingId);
       }
-      if (existingId) {
-        const existing = this.jobs.get(existingId.id) ?? (() => {
-          const row = this.db.getBootstrapJob(existingId!.id);
-          if (!row) return undefined;
-          const restored = this.fromRow(row);
-          this.jobs.set(restored.id, restored);
-          return restored;
-        })();
-        if (existing && (existing.host !== host || existing.port !== port || existing.username !== username
-          || !fingerprintEqual(existing.hostKeyFingerprint, fingerprint)
-          || (requestedServerId !== undefined && existing.serverId !== requestedServerId))) {
-          throw new BootstrapError("BOOTSTRAP_INVALID", "Idempotency-Key was already used for a different bootstrap target", 409);
-        }
-        if (existing) return { job: this.view(existing), existing: true };
-        this.idempotency.delete(idempotencyKey);
+    }
+    if (existingId) {
+      const existing = this.jobs.get(existingId.id) ?? (() => {
+        const row = this.db.getBootstrapJob(existingId!.id);
+        if (!row) return undefined;
+        const restored = this.fromRow(row);
+        this.jobs.set(restored.id, restored);
+        return restored;
+      })();
+      if (existing && (existing.host !== host || existing.port !== port || existing.username !== username
+        || !fingerprintEqual(existing.hostKeyFingerprint, fingerprint)
+        || (requestedServerId !== undefined && existing.serverId !== requestedServerId))) {
+        throw new BootstrapError("BOOTSTRAP_INVALID", "Idempotency-Key was already used for a different bootstrap target", 409);
       }
+      if (existing) return { job: this.view(existing), existing: true };
+      this.idempotency.delete(idempotencyKey);
     }
     const preflight = this.preflights.get(preflightId);
     if (!preflight) throw new BootstrapError("BOOTSTRAP_EXPIRED", "SSH preflight was not found or has expired", 409);
@@ -961,6 +1135,17 @@ export class BootstrapManager {
     if (!fingerprintEqual(preflight.fingerprint, fingerprint)) {
       throw new BootstrapError("SSH_HOST_KEY_MISMATCH", "Confirmed host key fingerprint does not match preflight", 409,
         { expectedFingerprint: preflight.fingerprint });
+    }
+    const serverId = requestedServerId ?? `srv-${randomUUID()}`;
+    const recoveryLock = this.findRecoveryLock(requestedServerId, host, preflight.connectHost, port);
+    if (recoveryLock) {
+      throw new BootstrapError("BOOTSTRAP_RECOVERY_REQUIRED",
+        "SSH bootstrap is locked until an operator verifies the previous remote state", 409, {
+          serverId: recoveryLock.server_id,
+          bootstrapJobId: recoveryLock.bootstrap_job_id,
+          host: recoveryLock.host,
+          port: recoveryLock.port,
+        });
     }
     const controlPlaneUrl = normalizeControlPlaneUrl(input.controlPlaneUrl ?? this.agentControlPlaneUrl, this.allowInsecureControlPlane);
     if (this.agentControlPlaneUrl) {
@@ -978,7 +1163,6 @@ export class BootstrapManager {
       throw new BootstrapError("BOOTSTRAP_BUSY", "An SSH bootstrap is already running for this host", 429);
     }
 
-    const serverId = requestedServerId ?? `srv-${randomUUID()}`;
     if (this.isServerBusy(serverId)) throw new BootstrapError("BOOTSTRAP_BUSY", "An SSH bootstrap is already running for this server", 429);
 
     // Consume the preflight token and persist the initial job atomically so a
@@ -1011,9 +1195,10 @@ export class BootstrapManager {
       cancelRequestedInternal: false,
       transportError: null,
       remoteStateUncertain: false,
+      recoveryRequired: false,
       serverMetadataTouched: false,
       installedAgentTokenHash: null,
-      idempotencyKey: idempotencyKey ?? null,
+      idempotencyKey,
       backupDir: "",
       remoteTouched: false,
     };
@@ -1023,7 +1208,7 @@ export class BootstrapManager {
     });
     this.preflights.delete(preflightId);
     this.jobs.set(job.id, job);
-    if (idempotencyKey) this.idempotency.set(idempotencyKey, { id: job.id, target: `${host}:${port}:${username}`, fingerprint, serverId });
+    this.idempotency.set(idempotencyKey, { id: job.id, target: `${host}:${port}:${username}`, fingerprint, serverId });
     this.activeCount += 1;
     const worker = this.execute(job, { serverName, region, os, controlPlaneUrl, actor, previous, password: input.password });
     this.workers.add(worker);
@@ -1042,11 +1227,11 @@ export class BootstrapManager {
     if (!job) throw new BootstrapError("BOOTSTRAP_NOT_FOUND", "Bootstrap job not found", 404);
     if (job.finishedAt) return this.view(job);
     job.cancelRequestedInternal = true;
-    this.persist(job);
+    this.tryPersist(job, "cancel_requested");
     if (job.connection) {
       try { job.connection.destroy(); } catch { /* best effort */ }
     }
-    this.audit({ action: "server.bootstrap.cancel_requested", targetType: "server", targetId: job.serverId,
+    this.tryAudit({ action: "server.bootstrap.cancel_requested", targetType: "server", targetId: job.serverId,
       target: job.host, detail: "SSH bootstrap cancellation requested", actor, correlationId: job.id });
     return this.view(job);
   }
@@ -1078,7 +1263,6 @@ export class BootstrapManager {
     const tempService = shellSafePath(`/tmp/server-ops-agent-${safeJob}.service`);
     const backupDir = shellSafePath(`${AGENT_STATE_DIR}/.bootstrap-${safeJob}`);
     job.backupDir = backupDir;
-    this.persist(job);
     const config = Buffer.from(JSON.stringify({
       controlPlaneUrl: context.controlPlaneUrl,
       intervalMs: 10_000,
@@ -1094,6 +1278,7 @@ export class BootstrapManager {
     let secret = context.password;
     const deadline = Date.now() + this.bootstrapTimeoutMs;
     try {
+      this.requirePersist(job, "worker_start");
       try { bundle = readFileSync(this.agentBundlePath); }
       catch { throw new BootstrapError("AGENT_BUNDLE_UNAVAILABLE", "Bundled Agent is unavailable on the control plane", 503); }
       this.assertNotCancelled(job);
@@ -1128,7 +1313,7 @@ export class BootstrapManager {
       if (observedType !== job.hostKeyType) throw new BootstrapError("SSH_HOST_KEY_MISMATCH", "SSH host key type changed since preflight", 409);
       job.stage = "checking_remote";
       job.progress = 15;
-      this.persist(job);
+      this.requirePersist(job);
       this.assertNotCancelled(job);
       if (Date.now() > deadline) throw new BootstrapError("SSH_TIMEOUT", "SSH bootstrap timed out", 504);
       const identity = await execRemote(client, "id -u", this.sshReadyTimeoutMs, job);
@@ -1142,11 +1327,14 @@ export class BootstrapManager {
         throw new BootstrapError("AGENT_RUNTIME_UNAVAILABLE", "Target server requires systemd and Node.js 22 or newer at a supported path", 422);
       }
       service = Buffer.from(fixedAgentService(runtime.stdout.trim()), "utf8");
-      this.db.upsertServer({ id: job.serverId, name: context.serverName, region: context.region, address: job.host, os: context.os });
+      // Mark the control-plane metadata as touched before the write. If the
+      // SQLite call fails after a partial commit, the catch path must still
+      // attempt remote cleanup and retain a recovery lock.
       job.serverMetadataTouched = true;
+      this.db.upsertServer({ id: job.serverId, name: context.serverName, region: context.region, address: job.host, os: context.os });
       job.stage = "uploading_agent";
       job.progress = 30;
-      this.persist(job);
+      this.requirePersist(job);
       remoteTouched = true;
       job.remoteTouched = true;
       await writeSftp(client, tempBundle, bundle!, 0o600, job);
@@ -1155,24 +1343,24 @@ export class BootstrapManager {
       await writeSftp(client, tempService, service!, 0o644, job);
       job.stage = "installing_agent";
       job.progress = 55;
-      this.persist(job);
+      this.requirePersist(job);
       this.assertNotCancelled(job);
       const installCommand = this.installCommand({ tempBundle, tempConfig, tempEnv, tempService, backupDir });
       const installResult = await execRemote(client, installCommand, 45_000, job);
       if (installResult.code !== 0) throw new BootstrapError("AGENT_INSTALL_FAILED", "Remote Agent installation failed", 502,
         { output: truncateOutput(installResult.stderr || installResult.stdout) });
       const nextTokenHash = hashToken(token);
-      this.db.setAgentTokenHash(job.serverId, nextTokenHash);
       job.installedAgentTokenHash = nextTokenHash;
       credentialSwapped = true;
-      this.persist(job);
+      this.db.setAgentTokenHash(job.serverId, nextTokenHash);
+      this.requirePersist(job, "credential_rotated");
       this.onCredentialRotated?.(job.serverId);
       // The old session is removed by onCredentialRotated. Gate success on a
       // heartbeat received after this rotation, using server receipt time.
       job.heartbeatBefore = isoNow();
       job.stage = "starting_agent";
       job.progress = 75;
-      this.persist(job);
+      this.requirePersist(job);
       const startResult = await execRemote(client, this.startCommand({ backupDir }), 45_000, job);
       if (startResult.code !== 0) throw new BootstrapError("AGENT_INSTALL_FAILED", "Remote Agent service could not start", 502,
         { output: truncateOutput(startResult.stderr || startResult.stdout) });
@@ -1182,13 +1370,13 @@ export class BootstrapManager {
       job.connection = null;
       job.stage = "waiting_for_heartbeat";
       job.progress = 85;
-      this.persist(job);
+      this.requirePersist(job);
       while (Date.now() < deadline) {
         this.assertNotCancelled(job);
         const current = this.db.getServer(job.serverId);
         if (current?.last_heartbeat && (!job.heartbeatBefore || Date.parse(current.last_heartbeat) > Date.parse(job.heartbeatBefore))) {
           job.heartbeatAt = current.last_heartbeat;
-          this.persist(job);
+          this.requirePersist(job, "heartbeat_received");
           break;
         }
         await new Promise((resolvePromise) => setTimeout(resolvePromise, 500));
@@ -1197,7 +1385,7 @@ export class BootstrapManager {
       // A successful install no longer needs the backup and temporary files.
       job.stage = "cleaning_up";
       job.progress = 95;
-      this.persist(job);
+      this.requirePersist(job);
       const cleanupClient = this.sshClientFactory();
       try {
         await connectClient(cleanupClient, { ...connectConfig, password: secret });
@@ -1216,10 +1404,20 @@ export class BootstrapManager {
       job.errorCode = null;
       job.error = null;
       job.finishedAt = isoNow();
-      this.persist(job);
-      this.audit({ action: "server.bootstrap.succeeded", targetType: "server", targetId: job.serverId, target: context.serverName,
-        detail: "SSH bootstrap installed the Agent and received a heartbeat", actor: context.actor, correlationId: job.id,
-        metadata: { host: job.host, port: job.port, username: job.username, hostKeyFingerprint: job.hostKeyFingerprint } });
+      if (this.tryPersist(job, "completed")) {
+        this.tryAudit({ action: "server.bootstrap.succeeded", targetType: "server", targetId: job.serverId, target: context.serverName,
+          detail: "SSH bootstrap installed the Agent and received a heartbeat", actor: context.actor, correlationId: job.id,
+          metadata: { host: job.host, port: job.port, username: job.username, hostKeyFingerprint: job.hostKeyFingerprint } });
+      } else {
+        job.status = "rollback_unknown";
+        job.stage = "recovery_required";
+        job.errorCode = "BOOTSTRAP_ROLLBACK_UNKNOWN";
+        job.error = "Agent started, but the control plane could not persist the completed bootstrap state";
+        this.persistRecoveryRequired(job, "completion_persist_failed");
+        this.tryAudit({ action: "server.bootstrap.recovery_required", targetType: "server", targetId: job.serverId, target: context.serverName,
+          detail: job.error, actor: context.actor, correlationId: job.id,
+          metadata: { host: job.host, port: job.port, username: job.username } });
+      }
     } catch (error) {
       const mapped = error instanceof BootstrapError ? error : mapSshError(error, remoteTouched ? "command" : "connect");
       const wasCancelled = mapped.code === "BOOTSTRAP_CANCELLED" || job.cancelRequestedInternal;
@@ -1231,17 +1429,17 @@ export class BootstrapManager {
         job.errorCode = mapped.code;
         job.error = mapped.message;
       }
-      this.persist(job);
+      this.tryPersist(job, "failure_detected");
       if (remoteTouched || credentialSwapped || job.serverMetadataTouched) {
         job.rollbackAttempted = true;
         job.stage = "rolling_back";
         job.progress = Math.max(job.progress, 90);
         job.transportError = null;
-        this.persist(job);
+        this.tryPersist(job);
         const rolledBack = await this.rollback(job, { ...context, previous: context.previous, backupDir, tempBundle, tempConfig, tempEnv, tempService, secret });
         if (!rolledBack || job.remoteStateUncertain) {
           job.status = "rollback_unknown";
-          job.stage = "rollback_unknown";
+          job.stage = "recovery_required";
           job.errorCode = "BOOTSTRAP_ROLLBACK_UNKNOWN";
           job.error = "Bootstrap failed and remote rollback could not be verified";
         } else {
@@ -1254,8 +1452,9 @@ export class BootstrapManager {
       }
       job.progress = 100;
       job.finishedAt = isoNow();
-      this.persist(job);
-      this.audit({ action: job.status === "cancelled" ? "server.bootstrap.cancelled" : "server.bootstrap.failed",
+      if (job.status === "rollback_unknown") this.persistRecoveryRequired(job, "rollback_unverified");
+      else this.tryPersist(job, "terminal_failure");
+      this.tryAudit({ action: job.status === "cancelled" ? "server.bootstrap.cancelled" : "server.bootstrap.failed",
         targetType: "server", targetId: job.serverId, target: context.serverName,
         detail: job.error ?? "SSH bootstrap failed", actor: context.actor, correlationId: job.id,
         metadata: { host: job.host, port: job.port, username: job.username, code: job.errorCode, rollbackAttempted: job.rollbackAttempted } });
@@ -1270,8 +1469,7 @@ export class BootstrapManager {
       secret = "";
       context.password = "";
       this.activeCount = Math.max(0, this.activeCount - 1);
-      try { this.persist(job); }
-      catch (persistError) { this.logger.error(`Could not persist final SSH bootstrap state for ${job.id}`, persistError); }
+      this.tryPersist(job, "worker_finally");
     }
   }
 

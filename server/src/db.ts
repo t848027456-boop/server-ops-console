@@ -45,6 +45,19 @@ export interface BootstrapJobRow {
   backup_dir: string;
 }
 
+export interface BootstrapRecoveryLockRow {
+  server_id: string;
+  bootstrap_job_id: string;
+  host: string;
+  connect_host: string;
+  port: number;
+  reason: string;
+  created_at: string;
+  updated_at: string;
+  cleared_at: string | null;
+  cleared_by: string | null;
+}
+
 const isoNow = () => new Date().toISOString();
 
 function parseJson<T>(value: string | null, fallback: T): T {
@@ -211,6 +224,19 @@ export class OpsDatabase {
         backup_dir TEXT NOT NULL DEFAULT ''
       );
 
+      CREATE TABLE IF NOT EXISTS bootstrap_recovery_locks (
+        server_id TEXT PRIMARY KEY,
+        bootstrap_job_id TEXT NOT NULL,
+        host TEXT NOT NULL,
+        connect_host TEXT NOT NULL,
+        port INTEGER NOT NULL,
+        reason TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        cleared_at TEXT,
+        cleared_by TEXT
+      );
+
       CREATE INDEX IF NOT EXISTS idx_projects_server ON projects(server_id);
       CREATE INDEX IF NOT EXISTS idx_tasks_server_status ON tasks(server_id, status);
       CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_one_active_project
@@ -222,6 +248,8 @@ export class OpsDatabase {
       CREATE INDEX IF NOT EXISTS idx_bootstrap_preflights_expires ON bootstrap_preflights(expires_at);
       CREATE INDEX IF NOT EXISTS idx_bootstrap_jobs_created ON bootstrap_jobs(created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_bootstrap_jobs_server_status ON bootstrap_jobs(server_id, status);
+      CREATE INDEX IF NOT EXISTS idx_bootstrap_recovery_locks_active_target
+        ON bootstrap_recovery_locks(connect_host, port, cleared_at);
     `);
     const alertColumns = this.sqlite.prepare("PRAGMA table_info(alerts)").all() as Array<{ name: string }>;
     if (!alertColumns.some((column) => column.name === "active")) {
@@ -234,6 +262,20 @@ export class OpsDatabase {
     if (!taskColumns.some((column) => column.name === "cancel_requested")) {
       this.sqlite.exec("ALTER TABLE tasks ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0");
     }
+    // Upgrade databases created before recovery locks existed. A retained row
+    // also records a later explicit clear, so this backfill cannot re-lock it.
+    this.sqlite.exec(`
+      INSERT OR IGNORE INTO bootstrap_recovery_locks (
+        server_id, bootstrap_job_id, host, connect_host, port, reason,
+        created_at, updated_at, cleared_at, cleared_by
+      )
+      SELECT server_id, id, host, connect_host, port,
+        CASE WHEN error LIKE 'Control plane restarted%' THEN 'control_plane_restart' ELSE 'rollback_unverified' END,
+        updated_at, updated_at, NULL, NULL
+      FROM bootstrap_jobs
+      WHERE status = 'rollback_unknown'
+        AND (stage = 'recovery_required' OR remote_state_uncertain = 1)
+    `);
   }
 
   transaction<T>(operation: () => T): T {
@@ -321,6 +363,57 @@ export class OpsDatabase {
     return this.sqlite.prepare("SELECT * FROM bootstrap_jobs WHERE idempotency_key = ?").get(key) as BootstrapJobRow | undefined;
   }
 
+  upsertBootstrapRecoveryLock(input: BootstrapRecoveryLockRow) {
+    this.sqlite.prepare(`
+      INSERT INTO bootstrap_recovery_locks (
+        server_id, bootstrap_job_id, host, connect_host, port, reason,
+        created_at, updated_at, cleared_at, cleared_by
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)
+      ON CONFLICT(server_id) DO UPDATE SET
+        bootstrap_job_id = excluded.bootstrap_job_id,
+        host = excluded.host,
+        connect_host = excluded.connect_host,
+        port = excluded.port,
+        reason = excluded.reason,
+        created_at = excluded.created_at,
+        updated_at = excluded.updated_at,
+        cleared_at = NULL,
+        cleared_by = NULL
+    `).run(
+      input.server_id, input.bootstrap_job_id, input.host, input.connect_host,
+      input.port, input.reason, input.created_at, input.updated_at,
+    );
+  }
+
+  listBootstrapRecoveryLocks(activeOnly = true) {
+    const sql = activeOnly
+      ? "SELECT * FROM bootstrap_recovery_locks WHERE cleared_at IS NULL ORDER BY created_at DESC"
+      : "SELECT * FROM bootstrap_recovery_locks ORDER BY created_at DESC";
+    return this.sqlite.prepare(sql).all() as unknown as BootstrapRecoveryLockRow[];
+  }
+
+  getBootstrapRecoveryLock(serverId: string, activeOnly = true) {
+    const sql = activeOnly
+      ? "SELECT * FROM bootstrap_recovery_locks WHERE server_id = ? AND cleared_at IS NULL"
+      : "SELECT * FROM bootstrap_recovery_locks WHERE server_id = ?";
+    return this.sqlite.prepare(sql).get(serverId) as BootstrapRecoveryLockRow | undefined;
+  }
+
+  resolveBootstrapRecoveryLock(serverId: string, bootstrapJobId: string, actor: string, now = isoNow()) {
+    const result = this.sqlite.prepare(`
+      UPDATE bootstrap_recovery_locks
+      SET cleared_at = ?, cleared_by = ?, updated_at = ?
+      WHERE server_id = ? AND bootstrap_job_id = ? AND cleared_at IS NULL
+    `).run(now, actor, now, serverId, bootstrapJobId);
+    if (Number(result.changes) !== 1) return false;
+    this.sqlite.prepare(`
+      UPDATE bootstrap_jobs
+      SET stage = 'recovery_resolved', remote_state_uncertain = 0, updated_at = ?
+      WHERE id = ? AND server_id = ?
+    `).run(now, bootstrapJobId, serverId);
+    return true;
+  }
+
   recoverInterruptedBootstrapJobs(now = isoNow()) {
     const rows = this.sqlite.prepare("SELECT * FROM bootstrap_jobs WHERE status IN ('queued', 'running') ORDER BY created_at ASC")
       .all() as unknown as BootstrapJobRow[];
@@ -333,13 +426,41 @@ export class OpsDatabase {
           remote_state_uncertain = 1
         WHERE id = ? AND status IN ('queued', 'running')
       `);
-      for (const row of rows) update.run(now, now, row.id);
+      const lock = this.sqlite.prepare(`
+        INSERT INTO bootstrap_recovery_locks (
+          server_id, bootstrap_job_id, host, connect_host, port, reason,
+          created_at, updated_at, cleared_at, cleared_by
+        ) VALUES (?, ?, ?, ?, ?, 'control_plane_restart', ?, ?, NULL, NULL)
+        ON CONFLICT(server_id) DO UPDATE SET
+          bootstrap_job_id = excluded.bootstrap_job_id,
+          host = excluded.host,
+          connect_host = excluded.connect_host,
+          port = excluded.port,
+          reason = excluded.reason,
+          created_at = excluded.created_at,
+          updated_at = excluded.updated_at,
+          cleared_at = NULL,
+          cleared_by = NULL
+      `);
+      for (const row of rows) {
+        update.run(now, now, row.id);
+        lock.run(row.server_id, row.id, row.host, row.connect_host, row.port, now, now);
+      }
       return rows.map((row) => this.sqlite.prepare("SELECT * FROM bootstrap_jobs WHERE id = ?").get(row.id) as unknown as BootstrapJobRow);
     });
   }
 
   deleteBootstrapJobsFinishedBefore(cutoff: string) {
-    this.sqlite.prepare("DELETE FROM bootstrap_jobs WHERE finished_at IS NOT NULL AND finished_at < ?").run(cutoff);
+    this.sqlite.prepare(`
+      DELETE FROM bootstrap_jobs
+      WHERE finished_at IS NOT NULL AND finished_at < ?
+        AND remote_state_uncertain = 0
+        AND stage <> 'recovery_required'
+        AND NOT EXISTS (
+          SELECT 1 FROM bootstrap_recovery_locks locks
+          WHERE locks.bootstrap_job_id = bootstrap_jobs.id AND locks.cleared_at IS NULL
+        )
+    `).run(cutoff);
   }
 
   deleteBootstrapJob(id: string) {

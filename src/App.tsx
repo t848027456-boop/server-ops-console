@@ -38,7 +38,7 @@ import {
   UserRound,
   X,
 } from "lucide-react";
-import { api, waitForTask } from "./api";
+import { api, ensureBootstrapFlow, rememberBootstrapJob, waitForTask } from "./api";
 import type { AlertItem, AuditItem, BootstrapJob, BootstrapPreflight, Health, Overview, Project, Server, Task } from "./data";
 
 type Page = "dashboard" | "servers" | "projects" | "releases" | "alerts" | "audit";
@@ -213,11 +213,12 @@ function Dashboard({ overview, servers, projects, alerts, tasks, onPage, onServe
   </>;
 }
 
-function ServersView({ servers, onSelect, onEnroll }: { servers: Server[]; onSelect: (server: Server) => void; onEnroll: () => void }) {
+function ServersView({ servers, bootstrapJobs, onSelect, onEnroll, onHistory }: { servers: Server[]; bootstrapJobs: BootstrapJob[]; onSelect: (server: Server) => void; onEnroll: () => void; onHistory: () => void }) {
   const [filter, setFilter] = useState<ServerFilter>("all");
   const hasIssue = (server: Server) => ["warning", "critical", "offline", "unknown"].includes(server.health);
   const visible = servers.filter((server) => filter === "online" ? server.agentConnected : filter === "issues" ? hasIssue(server) : true);
-  return <section className="panel panel--table page-panel"><div className="toolbar-row"><div className="segmented"><button className={filter === "all" ? "is-active" : ""} type="button" onClick={() => setFilter("all")}>全部 {servers.length}</button><button className={filter === "online" ? "is-active" : ""} type="button" onClick={() => setFilter("online")}>在线 {servers.filter((server) => server.agentConnected).length}</button><button className={filter === "issues" ? "is-active" : ""} type="button" onClick={() => setFilter("issues")}>异常 {servers.filter(hasIssue).length}</button></div><button className="button button--secondary" type="button" onClick={onEnroll}><CloudCog size={16} /> 接入服务器</button></div>{visible.length || !servers.length ? <ServerTable servers={visible} onSelect={onSelect} /> : <EmptyState title="没有符合条件的服务器" detail="切换筛选条件可查看其他服务器。" />}</section>;
+  const needsReview = bootstrapJobs.filter(bootstrapNeedsReview).length;
+  return <section className="panel panel--table page-panel"><div className="toolbar-row"><div className="segmented"><button className={filter === "all" ? "is-active" : ""} type="button" onClick={() => setFilter("all")}>全部 {servers.length}</button><button className={filter === "online" ? "is-active" : ""} type="button" onClick={() => setFilter("online")}>在线 {servers.filter((server) => server.agentConnected).length}</button><button className={filter === "issues" ? "is-active" : ""} type="button" onClick={() => setFilter("issues")}>异常 {servers.filter(hasIssue).length}</button></div><div className="toolbar-actions"><button className={`button button--secondary${needsReview ? " button--attention" : ""}`} type="button" onClick={onHistory}><History size={16} /> 接入记录{needsReview ? <span className="button-badge">{needsReview}</span> : null}</button><button className="button button--secondary" type="button" onClick={onEnroll}><CloudCog size={16} /> 接入服务器</button></div></div>{visible.length || !servers.length ? <ServerTable servers={visible} onSelect={onSelect} /> : <EmptyState title="没有符合条件的服务器" detail="切换筛选条件可查看其他服务器。" />}</section>;
 }
 
 function ProjectsView({ projects, servers, onSelect, onPreflight, onRegister }: { projects: Project[]; servers: Server[]; onSelect: (project: Project) => void; onPreflight: (project: Project) => void; onRegister: () => void }) {
@@ -242,12 +243,15 @@ function TaskCenter({ tasks, projects, servers, onPreflight, onChanged }: { task
   </div>;
 }
 
-function AlertsView({ alerts, acknowledge }: { alerts: AlertItem[]; acknowledge: (id: string) => Promise<void> }) {
+function AlertsView({ alerts, acknowledge, onBootstrapJob }: { alerts: AlertItem[]; acknowledge: (id: string) => Promise<void>; onBootstrapJob: (jobId: string) => void }) {
   const [filter, setFilter] = useState<AlertFilter>("unresolved");
   const unresolved = alerts.filter((alert) => alert.active && !alert.acknowledged).length;
   const visible = filter === "unresolved" ? alerts.filter((alert) => alert.active && !alert.acknowledged) : alerts;
   return <section className="panel alert-list-panel"><div className="toolbar-row"><div className="segmented"><button className={filter === "unresolved" ? "is-active" : ""} type="button" onClick={() => setFilter("unresolved")}>待处理 {unresolved}</button><button className={filter === "all" ? "is-active" : ""} type="button" onClick={() => setFilter("all")}>全部 {alerts.length}</button></div></div>
-    {!visible.length ? <EmptyState title={alerts.length ? "没有待处理告警" : "当前没有告警"} detail="Agent 失联、磁盘门禁和项目异常会写入这里。" /> : <div className="alerts-list">{visible.map((alert) => <article className={`alert-row alert-row--${alert.level}${alert.acknowledged || !alert.active ? " alert-row--muted" : ""}`} key={alert.id}><span className="alert-row__icon">{alert.level === "critical" ? <AlertCircle size={20} /> : alert.level === "warning" ? <AlertTriangle size={20} /> : <CircleDot size={20} />}</span><div className="alert-row__body"><div><strong>{alert.title}</strong><span className={`tag tag--${alert.level}`}>{alert.level === "critical" ? "严重" : alert.level === "warning" ? "警告" : "提醒"}</span></div><p>{alert.detail}</p><small>{alert.target} · {relativeTime(alert.createdAt)}</small></div>{!alert.active ? <span className="acknowledged"><Check size={15} /> 已恢复</span> : alert.acknowledged ? <span className="acknowledged"><Check size={15} /> {alert.acknowledgedBy || "已确认"}</span> : <button className="button button--secondary button--small" type="button" onClick={() => void acknowledge(alert.id)}>确认告警</button>}</article>)}</div>}
+    {!visible.length ? <EmptyState title={alerts.length ? "没有待处理告警" : "当前没有告警"} detail="Agent 失联、磁盘门禁和项目异常会写入这里。" /> : <div className="alerts-list">{visible.map((alert) => {
+      const recoveryJobId = alert.id.startsWith("bootstrap-recovery-") ? alert.id.slice("bootstrap-recovery-".length) : null;
+      return <article className={`alert-row alert-row--${alert.level}${alert.acknowledged || !alert.active ? " alert-row--muted" : ""}`} key={alert.id}><span className="alert-row__icon">{alert.level === "critical" ? <AlertCircle size={20} /> : alert.level === "warning" ? <AlertTriangle size={20} /> : <CircleDot size={20} />}</span><div className="alert-row__body"><div><strong>{alert.title}</strong><span className={`tag tag--${alert.level}`}>{recoveryJobId ? "人工复核" : alert.level === "critical" ? "严重" : alert.level === "warning" ? "警告" : "提醒"}</span></div><p>{alert.detail}</p><small>{alert.target} · {relativeTime(alert.createdAt)}</small></div><div className="alert-row__actions">{recoveryJobId ? <button className="button button--secondary button--small alert-history-button" aria-label="查看接入记录" title="查看接入记录" type="button" onClick={() => onBootstrapJob(recoveryJobId)}><History size={14} /> 查看接入记录</button> : null}{!alert.active ? <span className="acknowledged"><Check size={15} /> 已恢复</span> : alert.acknowledged ? <span className="acknowledged"><Check size={15} /> {alert.acknowledgedBy || "已确认"}</span> : <button className="button button--secondary button--small alert-ack-button" aria-label="确认告警" title="确认告警" type="button" onClick={() => void acknowledge(alert.id)}>确认告警</button>}</div></article>;
+    })}</div>}
   </section>;
 }
 
@@ -355,14 +359,44 @@ const bootstrapStages = [
 ];
 
 function bootstrapTerminal(job: BootstrapJob) {
-  return ["succeeded", "failed", "cancelled", "rollback_unknown"].includes(job.status) || job.stage === "succeeded";
+  return ["succeeded", "failed", "cancelled", "rollback_unknown"].includes(job.status) || ["succeeded", "recovery_required"].includes(job.stage || "");
+}
+
+function bootstrapNeedsReview(job: BootstrapJob) {
+  if (job.recoveryRequired !== undefined) return job.recoveryRequired;
+  return job.stage === "recovery_required" || (job.status === "rollback_unknown" && job.stage !== "recovery_resolved") || job.rollbackState === "unknown";
+}
+
+function bootstrapStatusLabel(job: BootstrapJob) {
+  if (bootstrapNeedsReview(job)) return "需要人工复核";
+  if (job.stage === "recovery_resolved") return "已解除恢复锁";
+  if (job.status === "succeeded" || job.stage === "succeeded") return "已完成";
+  if (job.status === "failed") return "安装失败";
+  if (job.status === "cancelled") return "已取消";
+  if (job.status === "running") return "执行中";
+  if (job.status === "queued" || job.status === "pending") return "等待执行";
+  return job.status || "未知状态";
+}
+
+function bootstrapTone(job: BootstrapJob) {
+  if (bootstrapNeedsReview(job) || job.status === "failed") return "critical";
+  if (job.status === "succeeded" || job.stage === "succeeded") return "healthy";
+  if (job.status === "cancelled") return "warning";
+  return "info";
+}
+
+function dateTimeText(value: string | null | undefined) {
+  if (!value) return "未记录";
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp)) return value;
+  return new Intl.DateTimeFormat("zh-CN", { dateStyle: "medium", timeStyle: "medium" }).format(new Date(timestamp));
 }
 
 function bootstrapStageLabel(job: BootstrapJob) {
+  if (bootstrapNeedsReview(job)) return "需要人工复核";
   if (job.status === "succeeded" || job.stage === "succeeded") return "Agent 已连接";
   if (job.status === "failed") return "安装失败";
   if (job.status === "cancelled") return "安装已取消";
-  if (job.status === "rollback_unknown") return "需要人工复核";
   const labels: Record<string, string> = {
     pending: "等待安装",
     queued: "等待安装",
@@ -435,6 +469,7 @@ function EnrollmentModal({ onClose, onCreated }: { onClose: () => Promise<void> 
     try {
       const result = await api.bootstrapPreflight({ address: sshForm.address.trim(), sshPort: port, sshUsername: sshForm.sshUsername.trim() });
       if (!result.preflightId || !result.hostKeyFingerprint) throw new Error("预检响应不完整，已停止继续操作");
+      ensureBootstrapFlow(result.preflightId, { host: sshForm.address.trim() });
       setPreflight(result);
     } catch (reason) {
       setError(bootstrapError(reason, "SSH 预检失败", sshForm.password));
@@ -455,6 +490,7 @@ function EnrollmentModal({ onClose, onCreated }: { onClose: () => Promise<void> 
     setJobError(null);
     setSshForm((current) => ({ ...current, password: "" }));
     try {
+      const flow = ensureBootstrapFlow(preflight.preflightId, { host: sshForm.address.trim() });
       const result = await api.bootstrap({
         preflightId: preflight.preflightId,
         id: sshForm.id.trim(),
@@ -466,8 +502,10 @@ function EnrollmentModal({ onClose, onCreated }: { onClose: () => Promise<void> 
         password: secret,
         hostKeyFingerprint: preflight.hostKeyFingerprint,
         controlPlaneUrl: `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/api/v1/agent/ws`,
+        idempotencyKey: flow.idempotencyKey,
       });
       if (!result.jobId) throw new Error("控制端未返回安装任务 ID");
+      rememberBootstrapJob(preflight.preflightId, result);
       setJob(result);
       await onCreated();
     } catch (reason) {
@@ -479,7 +517,9 @@ function EnrollmentModal({ onClose, onCreated }: { onClose: () => Promise<void> 
   };
 
   useEffect(() => {
-    if (!job?.jobId || bootstrapTerminal(job)) return;
+    const activeJob = job;
+    const activePreflightId = preflight?.preflightId;
+    if (!activeJob?.jobId || !activePreflightId || bootstrapTerminal(activeJob)) return;
     let disposed = false;
     let timer: number | null = null;
     const started = Date.now();
@@ -490,9 +530,10 @@ function EnrollmentModal({ onClose, onCreated }: { onClose: () => Promise<void> 
         return;
       }
       try {
-        const next = await api.bootstrapJob(job.jobId);
+        const next = await api.bootstrapJob(activeJob.jobId);
         if (disposed) return;
         setJob(next);
+        rememberBootstrapJob(activePreflightId, next);
         setJobError(null);
         if (!bootstrapTerminal(next)) timer = window.setTimeout(() => void poll(), 1_000);
       } catch (reason) {
@@ -503,7 +544,7 @@ function EnrollmentModal({ onClose, onCreated }: { onClose: () => Promise<void> 
     };
     timer = window.setTimeout(() => void poll(), 400);
     return () => { disposed = true; if (timer !== null) window.clearTimeout(timer); };
-  }, [job?.jobId]);
+  }, [job?.jobId, preflight?.preflightId]);
 
   const configSnippet = credential ? JSON.stringify({ controlPlaneUrl: `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}${credential.websocketPath}`, token: credential.agentToken, server: { id: form.id, name: form.name, region: form.region, address: form.address }, projects: [] }, null, 2) : "";
   const activeStage = job && !bootstrapTerminal(job) ? bootstrapVisualStage(job) : "";
@@ -580,7 +621,7 @@ function EnrollmentModal({ onClose, onCreated }: { onClose: () => Promise<void> 
         })}</div>
         {job.errorCode ? <div className="bootstrap-job-message"><AlertCircle size={14} /><span>错误码：<code>{job.errorCode}</code></span></div> : null}
         {job.message ? <div className="bootstrap-job-message"><AlertCircle size={14} /><span>{job.message}</span></div> : null}
-        {job.rollbackState ? <div className="bootstrap-job-message bootstrap-job-message--warning"><AlertTriangle size={14} /><span>回滚状态：{job.rollbackState}</span></div> : null}
+        {bootstrapNeedsReview(job) ? <div className="bootstrap-job-message bootstrap-job-message--recovery"><AlertTriangle size={14} /><span><strong>远端状态未知，需要人工复核。</strong> 先核查 Agent 和 systemd 状态；系统不会自动重试。</span></div> : job.rollbackState ? <div className="bootstrap-job-message bootstrap-job-message--warning"><AlertTriangle size={14} /><span>回滚状态：{job.rollbackState}</span></div> : null}
         {jobError ? <div className="inline-error"><AlertCircle size={15} />{jobError}</div> : null}
       </div> : null}
       {error ? <div className="inline-error"><AlertCircle size={16} />{error}</div> : null}
@@ -607,6 +648,42 @@ function EnrollmentModal({ onClose, onCreated }: { onClose: () => Promise<void> 
       </section>
     </div>
   );
+}
+
+function BootstrapHistoryModal({ jobs, initialJobId, onClose, onRefresh, onResolve }: { jobs: BootstrapJob[]; initialJobId: string | null; onClose: () => void; onRefresh: () => Promise<void>; onResolve: (job: BootstrapJob) => Promise<void> }) {
+  const [selectedJobId, setSelectedJobId] = useState<string | null>(initialJobId || jobs[0]?.jobId || null);
+  const [refreshing, setRefreshing] = useState(false);
+  const [resolving, setResolving] = useState(false);
+  const [recoveryConfirmed, setRecoveryConfirmed] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const sortedJobs = useMemo(() => [...jobs].sort((left, right) => Date.parse(right.createdAt || "") - Date.parse(left.createdAt || "")), [jobs]);
+  const selected = sortedJobs.find((item) => item.jobId === selectedJobId) || sortedJobs[0] || null;
+
+  useEffect(() => {
+    if (initialJobId && sortedJobs.some((item) => item.jobId === initialJobId)) setSelectedJobId(initialJobId);
+    else if (!selectedJobId || !sortedJobs.some((item) => item.jobId === selectedJobId)) setSelectedJobId(sortedJobs[0]?.jobId || null);
+  }, [initialJobId, selectedJobId, sortedJobs]);
+
+  useEffect(() => { setRecoveryConfirmed(false); setError(null); }, [selected?.jobId]);
+
+  const refresh = async () => {
+    setRefreshing(true);
+    setError(null);
+    try { await onRefresh(); } catch (reason) { setError(reason instanceof Error ? reason.message : "刷新接入记录失败"); } finally { setRefreshing(false); }
+  };
+
+  const resolve = async () => {
+    if (!selected?.serverId || !recoveryConfirmed) return;
+    setResolving(true);
+    setError(null);
+    try { await onResolve(selected); await onRefresh(); setRecoveryConfirmed(false); }
+    catch (reason) { setError(reason instanceof Error ? reason.message : "解除恢复锁失败"); }
+    finally { setResolving(false); }
+  };
+
+  return <div className="modal-shell" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><section className="release-modal bootstrap-history-modal" role="dialog" aria-modal="true" aria-label="接入记录"><div className="modal-head"><div><span className="eyebrow"><History size={14} /> SSH 接入</span><h2>接入记录</h2></div><div className="modal-head__actions"><IconButton label="刷新接入记录" onClick={() => void refresh()}>{refreshing ? <LoaderCircle className="spin" size={18} /> : <RefreshCw size={18} />}</IconButton><IconButton label="关闭" onClick={onClose}><X size={19} /></IconButton></div></div>
+    {!sortedJobs.length ? <EmptyState title="还没有接入记录" detail="SSH 预检并提交一次性安装后，任务会在这里持久化。" /> : <div className="bootstrap-history-layout"><div className="bootstrap-history-list" role="listbox" aria-label="接入任务列表">{sortedJobs.map((item) => <button className={`bootstrap-history-item${item.jobId === selected?.jobId ? " is-selected" : ""}`} type="button" role="option" aria-selected={item.jobId === selected?.jobId} key={item.jobId} onClick={() => setSelectedJobId(item.jobId)}><span className={`release-mark release-mark--${bootstrapTone(item)}`}>{bootstrapNeedsReview(item) ? <AlertTriangle size={14} /> : item.status === "succeeded" ? <Check size={14} /> : item.status === "failed" ? <AlertCircle size={14} /> : <LoaderCircle className={bootstrapTerminal(item) ? "" : "spin"} size={14} />}</span><span className="bootstrap-history-item__main"><strong>{item.host || item.serverId || "未命名主机"}</strong><small>{item.serverId || "未登记服务器"} · {relativeTime(item.createdAt)}</small></span><span className={`tag tag--${bootstrapTone(item)}`}>{bootstrapStatusLabel(item)}</span></button>)}</div><div className="bootstrap-history-detail">{selected ? <><div className={`bootstrap-history-status bootstrap-history-status--${bootstrapTone(selected)}`}><span className={`release-mark release-mark--${bootstrapTone(selected)}`}>{bootstrapNeedsReview(selected) ? <AlertTriangle size={16} /> : selected.status === "succeeded" ? <Check size={16} /> : selected.status === "failed" ? <AlertCircle size={16} /> : <LoaderCircle className={bootstrapTerminal(selected) ? "" : "spin"} size={16} />}</span><div><strong>{bootstrapStatusLabel(selected)}</strong><small>{selected.jobId}</small></div>{typeof selected.progress === "number" ? <b>{Math.round(Math.max(0, Math.min(100, selected.progress)))}%</b> : null}</div>{bootstrapNeedsReview(selected) ? <div className="bootstrap-recovery-banner"><AlertTriangle size={17} /><div><strong>远端状态未知，需要人工复核</strong><p>先核查 Agent 和 systemd 状态，再决定后续操作。系统不会自动重试，也不会在此处替你确认远端状态。</p><label className="bootstrap-recovery-confirm"><input type="checkbox" checked={recoveryConfirmed} onChange={(event) => setRecoveryConfirmed(event.target.checked)} /><span>我已核查目标服务器的 Agent、systemd 和配置状态</span></label><button className="button button--danger button--small" type="button" disabled={!recoveryConfirmed || !selected.serverId || resolving} onClick={() => void resolve()}>{resolving ? <LoaderCircle className="spin" size={15} /> : <ShieldCheck size={15} />}解除恢复锁</button></div></div> : null}<dl className="details-list bootstrap-history-details"><div><dt>服务器 ID</dt><dd>{selected.serverId || "未返回"}</dd></div><div><dt>主机地址</dt><dd>{selected.host || "未返回"}{selected.port ? `:${selected.port}` : ""}</dd></div><div><dt>SSH 用户</dt><dd>{selected.username || "未返回"}</dd></div><div><dt>当前阶段</dt><dd>{bootstrapStageLabel(selected)}{selected.stage ? ` · ${selected.stage}` : ""}</dd></div><div><dt>主机指纹</dt><dd><code>{selected.hostKeyFingerprint || "未返回"}</code></dd></div><div><dt>创建时间</dt><dd>{dateTimeText(selected.createdAt)}</dd></div><div><dt>开始时间</dt><dd>{dateTimeText(selected.startedAt)}</dd></div><div><dt>最近更新</dt><dd>{dateTimeText(selected.updatedAt)}</dd></div><div><dt>完成时间</dt><dd>{dateTimeText(selected.finishedAt)}</dd></div></dl>{selected.errorCode ? <div className="bootstrap-job-message"><AlertCircle size={14} /><span>错误码：<code>{selected.errorCode}</code></span></div> : null}{selected.message ? <div className="bootstrap-job-message"><AlertCircle size={14} /><span>{selected.message}</span></div> : null}{selected.rollbackState && !bootstrapNeedsReview(selected) ? <div className="bootstrap-job-message bootstrap-job-message--warning"><AlertTriangle size={14} /><span>回滚状态：{selected.rollbackState}</span></div> : null}</> : <EmptyState title="请选择接入任务" detail="从左侧列表选择一条记录查看详情。" />}</div></div>}
+    {error ? <div className="inline-error bootstrap-history-error"><AlertCircle size={16} />{error}</div> : null}<div className="modal-actions"><button className="button button--secondary" type="button" onClick={onClose}>关闭</button><button className="button button--secondary" type="button" disabled={refreshing} onClick={() => void refresh()}>{refreshing ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}刷新记录</button></div></section></div>;
 }
 
 function ProjectModal({ servers, onClose, onCreated }: { servers: Server[]; onClose: () => void; onCreated: () => Promise<void> }) {
@@ -669,10 +746,13 @@ export default function App() {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [alerts, setAlerts] = useState<AlertItem[]>([]);
   const [audit, setAudit] = useState<AuditItem[]>([]);
+  const [bootstrapJobs, setBootstrapJobs] = useState<BootstrapJob[]>([]);
   const [selectedServer, setSelectedServer] = useState<Server | null>(null);
   const [selectedProject, setSelectedProject] = useState<Project | null>(null);
   const [preflightProject, setPreflightProject] = useState<Project | null>(null);
   const [showEnrollment, setShowEnrollment] = useState(false);
+  const [showBootstrapHistory, setShowBootstrapHistory] = useState(false);
+  const [bootstrapHistoryJobId, setBootstrapHistoryJobId] = useState<string | null>(null);
   const [showProjectForm, setShowProjectForm] = useState(false);
   const [showAccess, setShowAccess] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -687,11 +767,11 @@ export default function App() {
     const requestId = ++loadSequence.current;
     if (!quiet) setLoading(true);
     try {
-      const results = await Promise.allSettled([api.overview(), api.servers(), api.projects(), api.tasks(), api.alerts(), api.audit()] as const);
+      const results = await Promise.allSettled([api.overview(), api.servers(), api.projects(), api.tasks(), api.alerts(), api.audit(), api.bootstrapJobs()] as const);
       if (requestId !== loadSequence.current) return false;
-      const labels = ["总览", "服务器", "项目", "任务", "告警", "审计"];
+      const labels = ["总览", "服务器", "项目", "任务", "告警", "审计", "接入记录"];
       const failures = results.flatMap((result, index) => result.status === "rejected" ? [labels[index]] : []);
-      const [nextOverview, nextServers, nextProjects, nextTasks, nextAlerts, nextAudit] = results;
+      const [nextOverview, nextServers, nextProjects, nextTasks, nextAlerts, nextAudit, nextBootstrapJobs] = results;
       if (nextOverview.status === "fulfilled") setOverview(nextOverview.value);
       if (nextServers.status === "fulfilled") {
         setServers(nextServers.value);
@@ -704,6 +784,7 @@ export default function App() {
       if (nextTasks.status === "fulfilled") setTasks(nextTasks.value);
       if (nextAlerts.status === "fulfilled") setAlerts(nextAlerts.value);
       if (nextAudit.status === "fulfilled") setAudit(nextAudit.value);
+      if (nextBootstrapJobs.status === "fulfilled") setBootstrapJobs(nextBootstrapJobs.value);
       setLoadError(failures.length ? `以下数据读取失败：${failures.join("、")}` : null);
       return failures.length === 0;
     } catch (reason) {
@@ -730,6 +811,12 @@ export default function App() {
   const refreshServer = async (server: Server) => { try { const task = await api.refreshServer(server.id); notify(`刷新任务已创建：${task.id.slice(0, 18)}`); await waitForTask(task.id, undefined, 30_000); await loadAll(true); notify("服务器状态刷新完成"); } catch (reason) { notify(failureText(reason, "服务器刷新失败"), "error"); } };
   const restartProject = async (project: Project) => { try { const task = await api.projectAction(project.id, "restart"); notify(`重启任务已创建：${task.id.slice(0, 18)}`); await waitForTask(task.id, undefined, 60_000); await loadAll(true); notify("重启任务执行完成"); } catch (reason) { notify(failureText(reason, "重启任务失败"), "error"); } };
   const openProject = (project: Project) => { setSelectedServer(null); setSelectedProject(project); };
+  const openBootstrapHistory = (jobId?: string) => { setBootstrapHistoryJobId(jobId || null); setShowBootstrapHistory(true); setPage("servers"); setSidebarOpen(false); };
+  const resolveBootstrapRecovery = async (job: BootstrapJob) => {
+    if (!job.serverId) throw new Error("恢复记录缺少服务器 ID，无法解除锁定");
+    await api.resolveBootstrapRecovery(job.serverId, job.jobId);
+    notify("恢复锁已解除；重新接入前请再次执行 SSH 预检");
+  };
   const projectServerConnected = (project: Project) => Boolean(servers.find((server) => server.id === project.serverId)?.agentConnected);
 
   const navItems: Array<{ id: Page; label: string; icon: typeof LayoutDashboard; badge?: number }> = [
@@ -738,7 +825,7 @@ export default function App() {
   const title = pageTitles[page];
 
   return <div className="app-shell"><aside className={`sidebar${sidebarOpen ? " sidebar--open" : ""}`}><div className="brand"><span className="brand-mark"><Activity size={19} /></span><div><strong>眺望</strong><span>项目运维台</span></div><IconButton label="收起导航" onClick={() => setSidebarOpen(false)}><PanelLeftClose size={18} /></IconButton></div><nav className="main-nav" aria-label="主导航"><span className="nav-label">工作台</span>{navItems.slice(0, 4).map((item) => { const ItemIcon = item.icon; return <button className={page === item.id ? "is-active" : ""} type="button" key={item.id} onClick={() => navigate(item.id)}><ItemIcon size={18} /><span>{item.label}</span>{item.badge ? <b>{item.badge}</b> : null}</button>; })}<span className="nav-label nav-label--spaced">管理</span>{navItems.slice(4).map((item) => { const ItemIcon = item.icon; return <button className={page === item.id ? "is-active" : ""} type="button" key={item.id} onClick={() => navigate(item.id)}><ItemIcon size={18} /><span>{item.label}</span>{item.badge ? <b>{item.badge}</b> : null}</button>; })}</nav><div className="sidebar-status"><div><span className="pulse-dot" /><strong>{loadError ? "控制端异常" : "控制端正常"}</strong></div><span>Agent {overview.connectedAgents} / {overview.servers.total} 在线</span></div><button className="account" type="button" onClick={() => { setShowAccess(true); setSidebarOpen(false); }}><span className="avatar"><UserRound size={17} /></span><span><strong>local-owner</strong><small>访问设置</small></span><LockKeyhole size={16} /></button></aside>{sidebarOpen ? <button className="sidebar-backdrop" type="button" aria-label="关闭导航" onClick={() => setSidebarOpen(false)} /> : null}
-    <main className="main-area"><header className="topbar"><IconButton label="打开导航" onClick={() => setSidebarOpen(true)}><Menu size={20} /></IconButton><div className="page-title"><h1>{title.title}</h1><span>{title.subtitle}</span></div><div className="topbar-actions"><span className="sync-label">同步于 {overview.generatedAt ? relativeTime(overview.generatedAt) : "等待控制端"}</span><IconButton label="刷新状态" onClick={() => void refresh()}><RefreshCw className={refreshing ? "spin" : ""} size={18} /></IconButton><button className="button button--secondary scan-button" type="button" onClick={() => void refresh()} disabled={refreshing}>{refreshing ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}{refreshing ? "正在刷新" : "刷新数据"}</button><IconButton label="通知" active={unresolvedAlerts > 0} onClick={() => navigate("alerts")}><Bell size={18} />{unresolvedAlerts ? <span className="notification-dot" /> : null}</IconButton></div></header><div className="content">{loadError ? <div className="connection-error"><AlertCircle size={18} /><div><strong>控制端数据未完整读取</strong><span>{loadError}</span></div><button className="button button--secondary button--small" type="button" onClick={() => setShowAccess(true)}>访问设置</button><button className="button button--secondary button--small" type="button" onClick={() => void loadAll()}>重试</button></div> : null}{loading ? <div className="page-loading"><LoaderCircle className="spin" size={22} /><span>正在读取真实状态</span></div> : <>{page === "dashboard" ? <Dashboard overview={overview} servers={servers} projects={projects} alerts={alerts} tasks={tasks} onPage={navigate} onServer={setSelectedServer} /> : null}{page === "servers" ? <ServersView servers={servers} onSelect={setSelectedServer} onEnroll={() => setShowEnrollment(true)} /> : null}{page === "projects" ? <ProjectsView projects={projects} servers={servers} onSelect={setSelectedProject} onPreflight={setPreflightProject} onRegister={() => setShowProjectForm(true)} /> : null}{page === "releases" ? <TaskCenter tasks={tasks} projects={projects} servers={servers} onPreflight={setPreflightProject} onChanged={async () => { await loadAll(true); }} /> : null}{page === "alerts" ? <AlertsView alerts={alerts} acknowledge={acknowledge} /> : null}{page === "audit" ? <AuditView items={audit} /> : null}</>}</div></main>
-    {selectedServer ? <ServerDrawer server={selectedServer} projects={projects} onClose={() => setSelectedServer(null)} onProject={openProject} onRefresh={refreshServer} /> : null}{selectedProject ? <ProjectDrawer project={selectedProject} serverConnected={projectServerConnected(selectedProject)} onClose={() => setSelectedProject(null)} onPreflight={() => { setPreflightProject(selectedProject); setSelectedProject(null); }} onRestart={() => restartProject(selectedProject)} /> : null}{preflightProject ? <PreflightModal project={preflightProject} serverConnected={projectServerConnected(preflightProject)} onClose={() => setPreflightProject(null)} onChanged={async () => { await loadAll(true); }} /> : null}{showEnrollment ? <EnrollmentModal onClose={() => setShowEnrollment(false)} onCreated={async () => { await loadAll(true); }} /> : null}{showProjectForm ? <ProjectModal servers={servers} onClose={() => setShowProjectForm(false)} onCreated={async () => { await loadAll(true); }} /> : null}{showAccess ? <AccessModal onClose={() => setShowAccess(false)} onSaved={async () => { await loadAll(); }} /> : null}{toast ? <div className={`toast toast--${toast.tone}`}>{toast.tone === "success" ? <CheckCircle2 size={17} /> : <AlertCircle size={17} />}{toast.message}</div> : null}
+    <main className="main-area"><header className="topbar"><IconButton label="打开导航" onClick={() => setSidebarOpen(true)}><Menu size={20} /></IconButton><div className="page-title"><h1>{title.title}</h1><span>{title.subtitle}</span></div><div className="topbar-actions"><span className="sync-label">同步于 {overview.generatedAt ? relativeTime(overview.generatedAt) : "等待控制端"}</span><IconButton label="刷新状态" onClick={() => void refresh()}><RefreshCw className={refreshing ? "spin" : ""} size={18} /></IconButton><button className="button button--secondary scan-button" type="button" onClick={() => void refresh()} disabled={refreshing}>{refreshing ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}{refreshing ? "正在刷新" : "刷新数据"}</button><IconButton label="通知" active={unresolvedAlerts > 0} onClick={() => navigate("alerts")}><Bell size={18} />{unresolvedAlerts ? <span className="notification-dot" /> : null}</IconButton></div></header><div className="content">{loadError ? <div className="connection-error"><AlertCircle size={18} /><div><strong>控制端数据未完整读取</strong><span>{loadError}</span></div><button className="button button--secondary button--small" type="button" onClick={() => setShowAccess(true)}>访问设置</button><button className="button button--secondary button--small" type="button" onClick={() => void loadAll()}>重试</button></div> : null}{loading ? <div className="page-loading"><LoaderCircle className="spin" size={22} /><span>正在读取真实状态</span></div> : <>{page === "dashboard" ? <Dashboard overview={overview} servers={servers} projects={projects} alerts={alerts} tasks={tasks} onPage={navigate} onServer={setSelectedServer} /> : null}{page === "servers" ? <ServersView servers={servers} bootstrapJobs={bootstrapJobs} onSelect={setSelectedServer} onEnroll={() => setShowEnrollment(true)} onHistory={() => openBootstrapHistory()} /> : null}{page === "projects" ? <ProjectsView projects={projects} servers={servers} onSelect={setSelectedProject} onPreflight={setPreflightProject} onRegister={() => setShowProjectForm(true)} /> : null}{page === "releases" ? <TaskCenter tasks={tasks} projects={projects} servers={servers} onPreflight={setPreflightProject} onChanged={async () => { await loadAll(true); }} /> : null}{page === "alerts" ? <AlertsView alerts={alerts} acknowledge={acknowledge} onBootstrapJob={openBootstrapHistory} /> : null}{page === "audit" ? <AuditView items={audit} /> : null}</>}</div></main>
+    {selectedServer ? <ServerDrawer server={selectedServer} projects={projects} onClose={() => setSelectedServer(null)} onProject={openProject} onRefresh={refreshServer} /> : null}{selectedProject ? <ProjectDrawer project={selectedProject} serverConnected={projectServerConnected(selectedProject)} onClose={() => setSelectedProject(null)} onPreflight={() => { setPreflightProject(selectedProject); setSelectedProject(null); }} onRestart={() => restartProject(selectedProject)} /> : null}{preflightProject ? <PreflightModal project={preflightProject} serverConnected={projectServerConnected(preflightProject)} onClose={() => setPreflightProject(null)} onChanged={async () => { await loadAll(true); }} /> : null}{showEnrollment ? <EnrollmentModal onClose={() => setShowEnrollment(false)} onCreated={async () => { await loadAll(true); }} /> : null}{showBootstrapHistory ? <BootstrapHistoryModal jobs={bootstrapJobs} initialJobId={bootstrapHistoryJobId} onClose={() => setShowBootstrapHistory(false)} onRefresh={async () => { await loadAll(true); }} onResolve={resolveBootstrapRecovery} /> : null}{showProjectForm ? <ProjectModal servers={servers} onClose={() => setShowProjectForm(false)} onCreated={async () => { await loadAll(true); }} /> : null}{showAccess ? <AccessModal onClose={() => setShowAccess(false)} onSaved={async () => { await loadAll(); }} /> : null}{toast ? <div className={`toast toast--${toast.tone}`}>{toast.tone === "success" ? <CheckCircle2 size={17} /> : <AlertCircle size={17} />}{toast.message}</div> : null}
   </div>;
 }
