@@ -22,6 +22,7 @@ COPY --from=build /app/package.json ./package.json
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
 COPY --from=build /app/server/dist ./server/dist
+COPY --from=build /app/agent/dist/ops-agent.cjs ./agent/dist/ops-agent.cjs
 COPY --from=build /app/docs ./docs
 COPY --from=build /app/README.md ./README.md
 
