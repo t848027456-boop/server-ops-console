@@ -1,0 +1,37 @@
+{
+  "name": "server-ops-console",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "dev": "vite",
+    "dev:server": "node --enable-source-maps server/dist/index.js",
+    "build": "tsc -b && vite build && pnpm server:build && pnpm agent:build",
+    "check": "tsc -b --pretty false && pnpm server:check && node --check agent/ops-agent.mjs",
+    "agent:build": "esbuild agent/ops-agent.mjs --bundle --platform=node --format=cjs --target=node22 --legal-comments=none --outfile=agent/dist/ops-agent.cjs",
+    "agent:check": "node --check agent/ops-agent.mjs && pnpm agent:build && node --check agent/dist/ops-agent.cjs",
+    "server:build": "tsc -p server/tsconfig.json",
+    "server:check": "tsc -p server/tsconfig.json --noEmit --pretty false",
+    "server:smoke": "pnpm server:build && node server/test/smoke.mjs",
+    "test": "pnpm server:smoke && pnpm agent:check"
+  },
+  "dependencies": {
+    "lucide-react": "^0.468.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "ws": "^8.21.3"
+  },
+  "devDependencies": {
+    "@types/node": "^24.13.3",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@types/ws": "^8.18.1",
+    "@vitejs/plugin-react": "^4.3.4",
+    "esbuild": "^0.28.2",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.3"
+  }
+}

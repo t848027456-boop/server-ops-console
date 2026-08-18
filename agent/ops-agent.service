@@ -1,0 +1,29 @@
+[Unit]
+Description=Server Ops Console Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+UMask=0077
+WorkingDirectory=/var/lib/server-ops-agent
+StateDirectory=server-ops-agent
+Environment=NODE_ENV=production
+EnvironmentFile=-/etc/server-ops-agent/agent.env
+ExecStart=/usr/bin/node /opt/server-ops-agent/ops-agent.cjs --config /etc/server-ops-agent/agent.config.json
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+ReadWritePaths=/var/lib/server-ops-agent
+
+[Install]
+WantedBy=multi-user.target

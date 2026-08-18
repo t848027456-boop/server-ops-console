@@ -1,0 +1,22 @@
+services:
+  console:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      OPS_HOST: 0.0.0.0
+      OPS_FRONTEND_DIR: /app/dist
+      OPS_DB_PATH: /data/ops-console.sqlite
+    ports:
+      - "8787:8787"
+    volumes:
+      - ops-console-data:/data
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8787/api/v1/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  ops-console-data:

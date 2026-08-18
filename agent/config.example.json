@@ -1,0 +1,77 @@
+{
+  "controlPlaneUrl": "ws://127.0.0.1:8787/api/v1/agent/ws",
+  "token": "replace-with-enrollment-token",
+  "intervalMs": 10000,
+  "server": {
+    "id": "srv-example",
+    "name": "示例服务器",
+    "region": "新加坡",
+    "address": "203.0.113.10"
+  },
+  "projects": [
+    {
+      "id": "example-compose",
+      "name": "示例 Compose 项目",
+      "type": "docker-compose",
+      "environment": "production",
+      "domain": "app.example.com",
+      "version": "v1.0.0",
+      "branch": "main",
+      "process": {
+        "composeProject": "example",
+        "containers": ["example-web-1"]
+      },
+      "runtime": {
+        "workingDirectory": "/opt/example",
+        "composeFiles": ["compose.yaml"]
+      },
+      "healthChecks": [
+        {
+          "id": "external",
+          "name": "公网健康检查",
+          "url": "https://app.example.com/api/health",
+          "expectedStatus": 200,
+          "timeoutMs": 8000,
+          "warningLatencyMs": 800,
+          "required": true
+        }
+      ],
+      "release": {
+        "minimumDiskFreeGb": 8,
+        "rollbackRef": "sha256:replace-with-stable-digest",
+        "backup": {
+          "required": true,
+          "lastSuccessFile": "/var/lib/ops-agent/backups/example.latest",
+          "maxAgeHours": 24
+        }
+      }
+    },
+    {
+      "id": "example-systemd",
+      "name": "示例 systemd 服务",
+      "type": "systemd",
+      "environment": "production",
+      "domain": "service.example.com",
+      "process": {
+        "unit": "example.service"
+      },
+      "healthChecks": [
+        {
+          "id": "internal",
+          "name": "内部健康检查",
+          "url": "http://127.0.0.1:8080/health",
+          "expectedStatus": 200,
+          "timeoutMs": 3000,
+          "required": true
+        }
+      ],
+      "release": {
+        "minimumDiskFreeGb": 4,
+        "rollbackRef": "systemd:previous-stable",
+        "backup": {
+          "required": false
+        }
+      }
+    }
+  ]
+}

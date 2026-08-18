@@ -1,0 +1,9 @@
+server/data/
+server/dist/
+dist/
+agent/dist/
+node_modules/
+*.tsbuildinfo
+.env
+.env.*
+!.env.example

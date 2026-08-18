@@ -1,0 +1,11 @@
+node_modules
+dist
+agent/dist
+server/dist
+server/data
+.git
+.github
+*.tsbuildinfo
+*.log
+.env
+!.env.example

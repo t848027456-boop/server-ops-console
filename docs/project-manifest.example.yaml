@@ -1,0 +1,54 @@
+apiVersion: ops.example.io/v1alpha1
+kind: Project
+metadata:
+  id: faceon
+  name: FaceOn
+  environment: production
+spec:
+  serverRef: srv-us-core
+  owner: xiaofu
+  runtime:
+    type: docker-compose
+    workingDirectory: /opt/faceon
+    composeFiles:
+      - compose.yaml
+    services:
+      - web
+      - worker
+  source:
+    type: container-registry
+    repository: registry.example.com/faceon
+    versionPolicy: signed-digest
+  health:
+    process:
+      required: true
+    internalHttp:
+      url: http://127.0.0.1:3000/api/health
+      expectedStatus: 200
+      timeoutSeconds: 3
+    externalHttp:
+      url: https://faceon.example.com/api/health
+      expectedStatus: 200
+      timeoutSeconds: 8
+    observationSeconds: 120
+  backup:
+    freshnessHours: 24
+    hookRef: backup-faceon
+    requiredBeforeRelease: true
+  release:
+    allowedBranches:
+      - main
+    requireImmutableDigest: true
+    concurrency: 1
+    rollback:
+      codeAndConfig: automatic
+      database: manual-approval
+    resourceGates:
+      minimumDiskFreeGb: 8
+      maximumLoad1m: 4.0
+  permissions:
+    allowedActions:
+      - refresh
+      - restart
+      - release
+      - rollback
