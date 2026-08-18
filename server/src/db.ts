@@ -3,6 +3,49 @@ import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { ProjectRow, ServerRow, TaskKind, TaskRow, TaskStatus } from "./types.js";
 
+export interface BootstrapPreflightRow {
+  id: string;
+  host: string;
+  connect_host: string;
+  port: number;
+  username: string;
+  fingerprint: string;
+  host_key_type: string;
+  created_at: string;
+  expires_at: string;
+}
+
+export interface BootstrapJobRow {
+  id: string;
+  idempotency_key: string | null;
+  status: string;
+  server_id: string;
+  host: string;
+  connect_host: string;
+  port: number;
+  username: string;
+  host_key_fingerprint: string;
+  host_key_type: string;
+  stage: string;
+  progress: number;
+  created_at: string;
+  started_at: string | null;
+  finished_at: string | null;
+  updated_at: string;
+  cancel_requested: number;
+  error_code: string | null;
+  error: string | null;
+  rollback_attempted: number;
+  heartbeat_at: string | null;
+  previous_agent_token_hash: string | null;
+  heartbeat_before: string | null;
+  remote_state_uncertain: number;
+  server_metadata_touched: number;
+  installed_agent_token_hash: string | null;
+  backup_dir: string;
+  previous_server_json: string | null;
+}
+
 const isoNow = () => new Date().toISOString();
 
 function parseJson<T>(value: string | null, fallback: T): T {
@@ -127,6 +170,49 @@ export class OpsDatabase {
         created_at TEXT NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS bootstrap_preflights (
+        id TEXT PRIMARY KEY,
+        host TEXT NOT NULL,
+        connect_host TEXT NOT NULL,
+        port INTEGER NOT NULL,
+        username TEXT NOT NULL,
+        fingerprint TEXT NOT NULL,
+        host_key_type TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS bootstrap_jobs (
+        id TEXT PRIMARY KEY,
+        idempotency_key TEXT UNIQUE,
+        status TEXT NOT NULL,
+        server_id TEXT NOT NULL,
+        host TEXT NOT NULL,
+        connect_host TEXT NOT NULL,
+        port INTEGER NOT NULL,
+        username TEXT NOT NULL,
+        host_key_fingerprint TEXT NOT NULL,
+        host_key_type TEXT NOT NULL,
+        stage TEXT NOT NULL,
+        progress INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        started_at TEXT,
+        finished_at TEXT,
+        updated_at TEXT NOT NULL,
+        cancel_requested INTEGER NOT NULL DEFAULT 0,
+        error_code TEXT,
+        error TEXT,
+        rollback_attempted INTEGER NOT NULL DEFAULT 0,
+        heartbeat_at TEXT,
+        previous_agent_token_hash TEXT,
+        heartbeat_before TEXT,
+        remote_state_uncertain INTEGER NOT NULL DEFAULT 0,
+        server_metadata_touched INTEGER NOT NULL DEFAULT 0,
+        installed_agent_token_hash TEXT,
+        backup_dir TEXT NOT NULL DEFAULT '',
+        previous_server_json TEXT
+      );
+
       CREATE INDEX IF NOT EXISTS idx_projects_server ON projects(server_id);
       CREATE INDEX IF NOT EXISTS idx_tasks_server_status ON tasks(server_id, status);
       CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_one_active_project
@@ -135,6 +221,9 @@ export class OpsDatabase {
       CREATE INDEX IF NOT EXISTS idx_task_events_task ON task_events(task_id, id);
       CREATE INDEX IF NOT EXISTS idx_alerts_ack_created ON alerts(acknowledged, created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_events(created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_bootstrap_preflights_expires ON bootstrap_preflights(expires_at);
+      CREATE INDEX IF NOT EXISTS idx_bootstrap_jobs_created ON bootstrap_jobs(created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_bootstrap_jobs_server_status ON bootstrap_jobs(server_id, status);
     `);
     const alertColumns = this.sqlite.prepare("PRAGMA table_info(alerts)").all() as Array<{ name: string }>;
     if (!alertColumns.some((column) => column.name === "active")) {
@@ -159,6 +248,104 @@ export class OpsDatabase {
       this.sqlite.exec("ROLLBACK");
       throw error;
     }
+  }
+
+  upsertBootstrapPreflight(input: BootstrapPreflightRow) {
+    this.sqlite.prepare(`
+      INSERT INTO bootstrap_preflights (id, host, connect_host, port, username, fingerprint, host_key_type, created_at, expires_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET host = excluded.host, connect_host = excluded.connect_host,
+        port = excluded.port, username = excluded.username, fingerprint = excluded.fingerprint,
+        host_key_type = excluded.host_key_type, created_at = excluded.created_at, expires_at = excluded.expires_at
+    `).run(input.id, input.host, input.connect_host, input.port, input.username, input.fingerprint,
+      input.host_key_type, input.created_at, input.expires_at);
+  }
+
+  listBootstrapPreflights() {
+    return this.sqlite.prepare("SELECT * FROM bootstrap_preflights ORDER BY created_at DESC").all() as unknown as BootstrapPreflightRow[];
+  }
+
+  getBootstrapPreflight(id: string) {
+    return this.sqlite.prepare("SELECT * FROM bootstrap_preflights WHERE id = ?").get(id) as BootstrapPreflightRow | undefined;
+  }
+
+  deleteBootstrapPreflight(id: string) {
+    this.sqlite.prepare("DELETE FROM bootstrap_preflights WHERE id = ?").run(id);
+  }
+
+  deleteExpiredBootstrapPreflights(now = isoNow()) {
+    this.sqlite.prepare("DELETE FROM bootstrap_preflights WHERE expires_at <= ?").run(now);
+  }
+
+  upsertBootstrapJob(input: BootstrapJobRow) {
+    this.sqlite.prepare(`
+      INSERT INTO bootstrap_jobs (
+        id, idempotency_key, status, server_id, host, connect_host, port, username,
+        host_key_fingerprint, host_key_type, stage, progress, created_at, started_at,
+        finished_at, updated_at, cancel_requested, error_code, error, rollback_attempted,
+        heartbeat_at, previous_agent_token_hash, heartbeat_before, remote_state_uncertain,
+        server_metadata_touched, installed_agent_token_hash, backup_dir, previous_server_json
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        idempotency_key = excluded.idempotency_key, status = excluded.status,
+        server_id = excluded.server_id, host = excluded.host, connect_host = excluded.connect_host,
+        port = excluded.port, username = excluded.username,
+        host_key_fingerprint = excluded.host_key_fingerprint, host_key_type = excluded.host_key_type,
+        stage = excluded.stage, progress = excluded.progress, started_at = excluded.started_at,
+        finished_at = excluded.finished_at, updated_at = excluded.updated_at,
+        cancel_requested = excluded.cancel_requested, error_code = excluded.error_code,
+        error = excluded.error, rollback_attempted = excluded.rollback_attempted,
+        heartbeat_at = excluded.heartbeat_at, previous_agent_token_hash = excluded.previous_agent_token_hash,
+        heartbeat_before = excluded.heartbeat_before, remote_state_uncertain = excluded.remote_state_uncertain,
+        server_metadata_touched = excluded.server_metadata_touched,
+        installed_agent_token_hash = excluded.installed_agent_token_hash,
+        backup_dir = excluded.backup_dir, previous_server_json = excluded.previous_server_json
+    `).run(
+      input.id, input.idempotency_key, input.status, input.server_id, input.host, input.connect_host,
+      input.port, input.username, input.host_key_fingerprint, input.host_key_type, input.stage,
+      input.progress, input.created_at, input.started_at, input.finished_at, input.updated_at,
+      input.cancel_requested, input.error_code, input.error, input.rollback_attempted,
+      input.heartbeat_at, input.previous_agent_token_hash, input.heartbeat_before,
+      input.remote_state_uncertain, input.server_metadata_touched, input.installed_agent_token_hash,
+      input.backup_dir, input.previous_server_json,
+    );
+  }
+
+  listBootstrapJobs() {
+    return this.sqlite.prepare("SELECT * FROM bootstrap_jobs ORDER BY created_at DESC").all() as unknown as BootstrapJobRow[];
+  }
+
+  getBootstrapJob(id: string) {
+    return this.sqlite.prepare("SELECT * FROM bootstrap_jobs WHERE id = ?").get(id) as BootstrapJobRow | undefined;
+  }
+
+  getBootstrapJobByIdempotencyKey(key: string) {
+    return this.sqlite.prepare("SELECT * FROM bootstrap_jobs WHERE idempotency_key = ?").get(key) as BootstrapJobRow | undefined;
+  }
+
+  recoverInterruptedBootstrapJobs(now = isoNow()) {
+    const rows = this.sqlite.prepare("SELECT * FROM bootstrap_jobs WHERE status IN ('queued', 'running') ORDER BY created_at ASC")
+      .all() as unknown as BootstrapJobRow[];
+    if (!rows.length) return rows;
+    return this.transaction(() => {
+      const update = this.sqlite.prepare(`
+        UPDATE bootstrap_jobs SET status = 'rollback_unknown', stage = 'recovery_required', progress = 100,
+          finished_at = ?, updated_at = ?, error_code = 'BOOTSTRAP_ROLLBACK_UNKNOWN',
+          error = 'Control plane restarted while SSH bootstrap was in progress; verify the remote server before retrying',
+          remote_state_uncertain = 1
+        WHERE id = ? AND status IN ('queued', 'running')
+      `);
+      for (const row of rows) update.run(now, now, row.id);
+      return rows.map((row) => this.sqlite.prepare("SELECT * FROM bootstrap_jobs WHERE id = ?").get(row.id) as unknown as BootstrapJobRow);
+    });
+  }
+
+  deleteBootstrapJobsFinishedBefore(cutoff: string) {
+    this.sqlite.prepare("DELETE FROM bootstrap_jobs WHERE finished_at IS NOT NULL AND finished_at < ?").run(cutoff);
+  }
+
+  deleteBootstrapJob(id: string) {
+    this.sqlite.prepare("DELETE FROM bootstrap_jobs WHERE id = ?").run(id);
   }
 
   getServer(id: string) {

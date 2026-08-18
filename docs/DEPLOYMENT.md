@@ -22,4 +22,6 @@ Use the host firewall to restrict outbound access to the control-plane hostname 
 
 The control plane never automatically replays a task that was already running when an Agent connection disappeared. It records the task as failed with `state: "unknown"`; verify the host before retrying a restart or other side-effecting operation. A task that was dispatched but not started is re-queued after reconnect.
 
+SSH bootstrap metadata is persisted in SQLite, but the root password is never persisted. If the control plane restarts during a bootstrap, the job is retained as `rollback_unknown` with `recovery_required` and a critical alert is created. Do not submit a second bootstrap until the target host and Agent state have been checked. The Compose service has a two-minute stop grace period so normal upgrades can finish a bounded SSH cleanup/rollback.
+
 For a rollback, restore the SQLite backup and the previous container image together. Application release and rollback adapters are intentionally not enabled in V0.

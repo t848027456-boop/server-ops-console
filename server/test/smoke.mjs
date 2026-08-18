@@ -88,7 +88,7 @@ class FakeSshClient extends EventEmitter {
 }
 
 assert.throws(() => createOpsServer({ dbPath: join(temporaryDirectory, "unauthenticated.sqlite") }), /OPS_ADMIN_TOKEN/);
-const app = createOpsServer({
+const appOptions = {
   dbPath: join(temporaryDirectory, "ops.sqlite"),
   frontendDir: frontendDirectory,
   adminToken: "smoke-admin-token",
@@ -99,12 +99,13 @@ const app = createOpsServer({
   agentBundlePath: bootstrapBundlePath,
   sshClientFactory: () => new FakeSshClient(),
   logger: { info() {}, warn() {}, error: console.error },
-});
+};
+const app = createOpsServer(appOptions);
 
 await new Promise((resolveListen) => app.httpServer.listen(0, "127.0.0.1", resolveListen));
 const address = app.httpServer.address();
 assert(address && typeof address === "object");
-const baseUrl = `http://127.0.0.1:${address.port}`;
+let baseUrl = `http://127.0.0.1:${address.port}`;
 bootstrapBaseUrl = baseUrl;
 
 async function api(path, options = {}, expectedStatus = 200) {
@@ -117,6 +118,8 @@ async function api(path, options = {}, expectedStatus = 200) {
 }
 
 let agent;
+let restartedApp;
+let originalAppClosed = false;
 try {
   const health = await api("/api/v1/health");
   assert.equal(health.status, "ok");
@@ -554,6 +557,133 @@ try {
   assert.equal(agent.protocol, "ops-agent");
   assert.equal((await receive((message) => message.type === "hello_ack")).serverId, "smoke-server");
 
+  // Bootstrap metadata must survive a control-plane restart without ever
+  // persisting the SSH password. Seed one interrupted row to exercise the
+  // explicit recovery state, and leave a preflight token pending for reuse.
+  const restartPreflight = await api("/api/v1/servers/bootstrap/preflight", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ address: "203.0.113.11", sshPort: 2222, sshUsername: "root" }),
+  });
+  const recoveryCreatedAt = new Date().toISOString();
+  app.db.upsertBootstrapJob({
+    id: "bootstrap-recovery-smoke",
+    idempotency_key: "bootstrap-recovery-001",
+    status: "running",
+    server_id: "bootstrap-recovery-server",
+    host: "203.0.113.11",
+    connect_host: "203.0.113.11",
+    port: 2222,
+    username: "root",
+    host_key_fingerprint: restartPreflight.data.hostKeyFingerprint,
+    host_key_type: restartPreflight.data.hostKeyType,
+    stage: "uploading_agent",
+    progress: 30,
+    created_at: recoveryCreatedAt,
+    started_at: recoveryCreatedAt,
+    finished_at: null,
+    updated_at: recoveryCreatedAt,
+    cancel_requested: 0,
+    error_code: null,
+    error: null,
+    rollback_attempted: 0,
+    heartbeat_at: null,
+    previous_agent_token_hash: null,
+    heartbeat_before: null,
+    remote_state_uncertain: 1,
+    server_metadata_touched: 1,
+    installed_agent_token_hash: null,
+    backup_dir: "/var/lib/server-ops-agent/.bootstrap-recovery-smoke",
+    previous_server_json: null,
+  });
+  const bootstrapRowsBeforeRestart = JSON.stringify(app.db.sqlite.prepare("SELECT * FROM bootstrap_jobs").all());
+  assert(!bootstrapRowsBeforeRestart.includes("bootstrap smoke password"));
+
+  await new Promise((resolveClose) => {
+    agent.once("close", resolveClose);
+    agent.close();
+  });
+  agent = undefined;
+  await app.close();
+  originalAppClosed = true;
+
+  restartedApp = createOpsServer(appOptions);
+  await new Promise((resolveListen) => restartedApp.httpServer.listen(0, "127.0.0.1", resolveListen));
+  const restartedAddress = restartedApp.httpServer.address();
+  assert(restartedAddress && typeof restartedAddress === "object");
+  baseUrl = `http://127.0.0.1:${restartedAddress.port}`;
+  bootstrapBaseUrl = baseUrl;
+
+  const restartedJobs = await api("/api/v1/servers/bootstrap");
+  const recoveredBootstrap = restartedJobs.data.find((item) => item.id === "bootstrap-recovery-smoke");
+  assert.equal(recoveredBootstrap.status, "rollback_unknown");
+  assert.equal(recoveredBootstrap.stage, "recovery_required");
+  assert.equal(recoveredBootstrap.errorCode, "BOOTSTRAP_ROLLBACK_UNKNOWN");
+  assert(recoveredBootstrap.finishedAt);
+
+  const recoveredReplay = await api("/api/v1/servers/bootstrap", {
+    method: "POST",
+    headers: { "content-type": "application/json", "idempotency-key": "bootstrap-recovery-001" },
+    body: JSON.stringify({
+      preflightId: restartPreflight.data.id,
+      address: "203.0.113.11",
+      sshPort: 2222,
+      sshUsername: "root",
+      hostKeyFingerprint: restartPreflight.data.hostKeyFingerprint,
+      password: "bootstrap smoke password",
+      id: "bootstrap-recovery-server",
+      controlPlaneUrl: baseUrl,
+    }),
+  });
+  assert.equal(recoveredReplay.idempotentReplay, true);
+  assert.equal(recoveredReplay.data.id, "bootstrap-recovery-smoke");
+
+  const terminalReplay = await api("/api/v1/servers/bootstrap", {
+    method: "POST",
+    headers: { "content-type": "application/json", "idempotency-key": "bootstrap-success-001" },
+    body: JSON.stringify({
+      preflightId: restartPreflight.data.id,
+      address: "203.0.113.10",
+      sshPort: 2222,
+      sshUsername: "root",
+      hostKeyFingerprint: bootstrapPreflight.data.hostKeyFingerprint,
+      password: "bootstrap smoke password",
+      id: "bootstrap-smoke-server",
+      controlPlaneUrl: baseUrl,
+    }),
+  });
+  assert.equal(terminalReplay.idempotentReplay, true);
+  assert.equal(terminalReplay.data.id, bootstrapStarted.data.id);
+
+  bootstrapUploads.clear();
+  const postRestartBootstrap = await api("/api/v1/servers/bootstrap", {
+    method: "POST",
+    headers: { "content-type": "application/json", "idempotency-key": "bootstrap-after-restart-001" },
+    body: JSON.stringify({
+      preflightId: restartPreflight.data.id,
+      address: "203.0.113.11",
+      sshPort: 2222,
+      sshUsername: "root",
+      hostKeyFingerprint: restartPreflight.data.hostKeyFingerprint,
+      password: "bootstrap smoke password",
+      id: "bootstrap-restart-server",
+      name: "Bootstrap Restart Server",
+      controlPlaneUrl: baseUrl,
+    }),
+  }, 202);
+  let postRestartJob;
+  for (let attempt = 0; attempt < 500; attempt += 1) {
+    postRestartJob = await api(`/api/v1/servers/bootstrap/${postRestartBootstrap.data.id}`);
+    if (["succeeded", "failed", "cancelled", "rollback_unknown"].includes(postRestartJob.data.status)) break;
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 25));
+  }
+  assert.equal(postRestartJob.data.status, "succeeded", JSON.stringify(postRestartJob));
+  assert.equal(restartedApp.db.listBootstrapPreflights().some((row) => row.id === restartPreflight.data.id), false);
+  const persistedBootstrapAfterRestart = JSON.stringify(restartedApp.db.sqlite.prepare("SELECT * FROM bootstrap_jobs").all());
+  assert(!persistedBootstrapAfterRestart.includes("bootstrap smoke password"));
+  await restartedApp.close();
+  restartedApp = undefined;
+
   console.log("server smoke test passed");
 } finally {
   if (agent && agent.readyState !== WebSocket.CLOSED) {
@@ -562,7 +692,8 @@ try {
       agent.close();
     });
   }
-  await app.close();
+  if (restartedApp) await restartedApp.close();
+  if (!originalAppClosed) await app.close();
   rmSync(temporaryDirectory, { recursive: true, force: true });
   rmSync(frontendDirectory, { recursive: true, force: true });
 }
