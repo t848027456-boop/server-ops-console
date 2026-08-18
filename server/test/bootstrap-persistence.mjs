@@ -53,7 +53,6 @@ db.upsertBootstrapJob({
   server_metadata_touched: 1,
   installed_agent_token_hash: null,
   backup_dir: "/var/lib/server-ops-agent/.bootstrap-bootstraprestart1",
-  previous_server_json: null,
 });
 db.close();
 

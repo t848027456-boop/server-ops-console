@@ -43,7 +43,6 @@ export interface BootstrapJobRow {
   server_metadata_touched: number;
   installed_agent_token_hash: string | null;
   backup_dir: string;
-  previous_server_json: string | null;
 }
 
 const isoNow = () => new Date().toISOString();
@@ -209,8 +208,7 @@ export class OpsDatabase {
         remote_state_uncertain INTEGER NOT NULL DEFAULT 0,
         server_metadata_touched INTEGER NOT NULL DEFAULT 0,
         installed_agent_token_hash TEXT,
-        backup_dir TEXT NOT NULL DEFAULT '',
-        previous_server_json TEXT
+        backup_dir TEXT NOT NULL DEFAULT ''
       );
 
       CREATE INDEX IF NOT EXISTS idx_projects_server ON projects(server_id);
@@ -284,8 +282,8 @@ export class OpsDatabase {
         host_key_fingerprint, host_key_type, stage, progress, created_at, started_at,
         finished_at, updated_at, cancel_requested, error_code, error, rollback_attempted,
         heartbeat_at, previous_agent_token_hash, heartbeat_before, remote_state_uncertain,
-        server_metadata_touched, installed_agent_token_hash, backup_dir, previous_server_json
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        server_metadata_touched, installed_agent_token_hash, backup_dir
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
         idempotency_key = excluded.idempotency_key, status = excluded.status,
         server_id = excluded.server_id, host = excluded.host, connect_host = excluded.connect_host,
@@ -299,7 +297,7 @@ export class OpsDatabase {
         heartbeat_before = excluded.heartbeat_before, remote_state_uncertain = excluded.remote_state_uncertain,
         server_metadata_touched = excluded.server_metadata_touched,
         installed_agent_token_hash = excluded.installed_agent_token_hash,
-        backup_dir = excluded.backup_dir, previous_server_json = excluded.previous_server_json
+        backup_dir = excluded.backup_dir
     `).run(
       input.id, input.idempotency_key, input.status, input.server_id, input.host, input.connect_host,
       input.port, input.username, input.host_key_fingerprint, input.host_key_type, input.stage,
@@ -307,7 +305,7 @@ export class OpsDatabase {
       input.cancel_requested, input.error_code, input.error, input.rollback_attempted,
       input.heartbeat_at, input.previous_agent_token_hash, input.heartbeat_before,
       input.remote_state_uncertain, input.server_metadata_touched, input.installed_agent_token_hash,
-      input.backup_dir, input.previous_server_json,
+      input.backup_dir,
     );
   }
 

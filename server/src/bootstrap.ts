@@ -779,7 +779,6 @@ export class BootstrapManager {
       server_metadata_touched: Number(job.serverMetadataTouched),
       installed_agent_token_hash: job.installedAgentTokenHash,
       backup_dir: job.backupDir,
-      previous_server_json: null,
     });
   }
 
@@ -1028,7 +1027,13 @@ export class BootstrapManager {
     this.activeCount += 1;
     const worker = this.execute(job, { serverName, region, os, controlPlaneUrl, actor, previous, password: input.password });
     this.workers.add(worker);
-    void worker.finally(() => this.workers.delete(worker));
+    void worker.then(
+      () => this.workers.delete(worker),
+      (error) => {
+        this.workers.delete(worker);
+        this.logger.error(`SSH bootstrap ${job.id} worker failed unexpectedly`, error);
+      },
+    );
     return { job: this.view(job), existing: false };
   }
 
@@ -1264,8 +1269,9 @@ export class BootstrapManager {
       env.fill(0);
       secret = "";
       context.password = "";
-      this.persist(job);
       this.activeCount = Math.max(0, this.activeCount - 1);
+      try { this.persist(job); }
+      catch (persistError) { this.logger.error(`Could not persist final SSH bootstrap state for ${job.id}`, persistError); }
     }
   }
 

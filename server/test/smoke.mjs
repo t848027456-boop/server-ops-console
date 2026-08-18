@@ -594,7 +594,6 @@ try {
     server_metadata_touched: 1,
     installed_agent_token_hash: null,
     backup_dir: "/var/lib/server-ops-agent/.bootstrap-recovery-smoke",
-    previous_server_json: null,
   });
   const bootstrapRowsBeforeRestart = JSON.stringify(app.db.sqlite.prepare("SELECT * FROM bootstrap_jobs").all());
   assert(!bootstrapRowsBeforeRestart.includes("bootstrap smoke password"));
