@@ -80,6 +80,8 @@ Task payloads are schema-limited. Refresh and restart accept only an optional `r
 
 New tasks are rejected while the target Agent is disconnected. A preflight whose checks run correctly but fail a gate remains an operationally successful task with `status: "succeeded"` and `result.ok: false`; transport or execution failures use `status: "failed"`.
 
+If an Agent disconnects after reporting `task_started`, the control plane marks the task failed with `result.state: "unknown"` and does not replay it automatically. Verify the host before retrying a side-effecting action. Tasks that were only dispatched and had not started are re-queued after reconnect.
+
 ## Agent protocol
 
 Create or rotate a server credential:
