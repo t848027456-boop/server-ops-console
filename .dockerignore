@@ -1,6 +1,7 @@
 node_modules
 dist
 agent/dist
+agent/runtime
 server/dist
 server/data
 .git

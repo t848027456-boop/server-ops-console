@@ -13,6 +13,7 @@
 - 任务幂等、服务器内串行执行、取消请求、事件记录和敏感字段脱敏
 - 服务器接入、项目登记及 Agent 配置片段生成
 - IP + root 密码一次性 SSH 接入，主机指纹确认、自动安装 Agent 和心跳验收
+- SSH 接入可向没有 Node.js 22 的主机下发镜像内托管运行时，支持 Linux x64 和 arm64
 - SQLite 持久化、告警确认、审计搜索/导出和任务详情
 
 ## 安全关闭
@@ -57,6 +58,8 @@ docker compose logs -f console
 ```
 
 SQLite 数据保存在 `ops-console-data` 卷中。默认只发布到宿主机 `127.0.0.1:8787`；升级前先备份该卷，生产环境通过 TLS 反向代理开放，Agent 仍通过主动 WebSocket 回连。详见 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)。
+
+控制端镜像从固定摘要的官方 Node.js 22 镜像中打包 Linux x64/arm64 运行时，用于 SSH 自动接入。它不会在目标机添加 APT 源或改动系统 Node.js；运行时安装在 `/opt/server-ops-agent/node`。当前支持边界是使用 systemd 和 glibc 的 Debian/Ubuntu x64 或 arm64 主机。
 
 ## 接入 Agent
 

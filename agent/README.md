@@ -1,6 +1,6 @@
 # Server Ops Agent
 
-Agent 使用 Node.js 22 或更高版本，主动连接控制端，不监听公网端口。发布包为单个 `ops-agent.cjs`，已内置 WebSocket 依赖。
+Agent 使用 Node.js 22 或更高版本，主动连接控制端，不监听公网端口。发布包为单个 `ops-agent.cjs`，已内置 WebSocket 依赖。通过控制台的 SSH 自动接入时，如果目标机没有兼容版本，控制端会下发自带的 Linux x64/arm64 托管运行时；手动安装仍可使用目标机已有的 Node.js。
 
 ## 构建与单次采集
 
@@ -14,6 +14,12 @@ node agent/dist/ops-agent.cjs --config agent.config.json --once
 `--once` 会采集真实 CPU、内存、磁盘、Docker、systemd 和项目健康检查，但不会连接控制端或执行任务。
 
 ## Linux 安装
+
+手动安装前确认目标机为使用 systemd 和 glibc 的 Debian/Ubuntu x64 或 arm64，并且 systemd unit 使用的 `/usr/bin/node` 为 22 或更高版本：
+
+```bash
+/usr/bin/node --version
+```
 
 ```bash
 sudo install -d -m 0755 /opt/server-ops-agent /etc/server-ops-agent
@@ -36,6 +42,8 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now ops-agent.service
 sudo systemctl status ops-agent.service
 ```
+
+SSH 自动接入不会添加软件源或替换系统 Node.js。需要托管运行时时，它会校验架构、上传摘要和可执行性，再将运行时原子安装为 `/opt/server-ops-agent/node`，systemd 服务只引用这个固定路径。Alpine/musl、ARMv7、32 位 x86 和没有 systemd 的主机当前不在支持范围内。
 
 ## 项目配置
 

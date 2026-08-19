@@ -44,6 +44,7 @@ export type BootstrapErrorCode =
   | "SSH_PRIVILEGE_REQUIRED"
   | "SSH_COMMAND_FAILED"
   | "AGENT_BUNDLE_UNAVAILABLE"
+  | "AGENT_ARCHITECTURE_UNSUPPORTED"
   | "AGENT_RUNTIME_UNAVAILABLE"
   | "AGENT_INSTALL_FAILED"
   | "AGENT_HEARTBEAT_TIMEOUT"
@@ -155,6 +156,8 @@ export interface BootstrapManagerOptions {
   audit: (input: BootstrapAuditInput) => void;
   agentControlPlaneUrl?: string;
   agentBundlePath?: string;
+  agentRuntimeX64Path?: string;
+  agentRuntimeArm64Path?: string;
   maxConcurrent?: number;
   preflightTtlMs?: number;
   bootstrapTimeoutMs?: number;
@@ -168,7 +171,7 @@ export interface BootstrapManagerOptions {
 }
 
 const DEFAULT_PREFLIGHT_TTL_MS = 10 * 60_000;
-const DEFAULT_BOOTSTRAP_TIMEOUT_MS = 3 * 60_000;
+const DEFAULT_BOOTSTRAP_TIMEOUT_MS = 10 * 60_000;
 const DEFAULT_SSH_READY_TIMEOUT_MS = 15_000;
 const BOOTSTRAP_JOB_RETENTION_MS = 30 * 24 * 60 * 60_000;
 const MAX_PASSWORD_LENGTH = 4096;
@@ -177,6 +180,8 @@ const AGENT_REMOTE_DIR = "/opt/server-ops-agent";
 const AGENT_CONFIG_DIR = "/etc/server-ops-agent";
 const AGENT_STATE_DIR = "/var/lib/server-ops-agent";
 const AGENT_SERVICE = "ops-agent.service";
+const AGENT_MANAGED_RUNTIME = `${AGENT_REMOTE_DIR}/node`;
+type AgentArchitecture = "x64" | "arm64";
 export const BOOTSTRAP_RECOVERY_CONFIRMATION = "I_HAVE_VERIFIED_REMOTE_STATE";
 
 // Reject IPv6 ranges that are not routable server targets or that can tunnel
@@ -223,6 +228,25 @@ ReadWritePaths=/var/lib/server-ops-agent
 [Install]
 WantedBy=multi-user.target
 `;
+}
+
+function agentArchitecture(value: string): AgentArchitecture | null {
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "x86_64" || normalized === "amd64") return "x64";
+  if (normalized === "aarch64" || normalized === "arm64") return "arm64";
+  return null;
+}
+
+function validateManagedRuntime(runtime: Buffer, architecture: AgentArchitecture) {
+  const expectedMachine = architecture === "x64" ? 62 : 183;
+  if (runtime.length < 64 || runtime[0] !== 0x7f || runtime.toString("ascii", 1, 4) !== "ELF"
+    || runtime[4] !== 2 || runtime[5] !== 1 || runtime.readUInt16LE(18) !== expectedMachine) {
+    throw new BootstrapError(
+      "AGENT_RUNTIME_UNAVAILABLE",
+      `Managed Agent runtime is not a Linux ${architecture} ELF executable`,
+      503,
+    );
+  }
 }
 
 function isoNow() {
@@ -667,12 +691,18 @@ function shellSafePath(path: string) {
   return path;
 }
 
+function shellSafeSha256(value: string) {
+  if (!/^[a-f0-9]{64}$/.test(value)) throw new Error("unsafe internal checksum");
+  return value;
+}
+
 export class BootstrapManager {
   private readonly db: OpsDatabase;
   private readonly logger: Pick<Console, "info" | "warn" | "error">;
   private readonly audit: BootstrapManagerOptions["audit"];
   private readonly agentControlPlaneUrl?: string;
   private readonly agentBundlePath: string;
+  private readonly agentRuntimePaths: Record<AgentArchitecture, string>;
   private readonly maxConcurrent: number;
   private readonly preflightTtlMs: number;
   private readonly bootstrapTimeoutMs: number;
@@ -698,6 +728,10 @@ export class BootstrapManager {
     this.audit = options.audit;
     this.agentControlPlaneUrl = options.agentControlPlaneUrl;
     this.agentBundlePath = resolve(options.agentBundlePath ?? resolve(process.cwd(), "agent/dist/ops-agent.cjs"));
+    this.agentRuntimePaths = {
+      x64: resolve(options.agentRuntimeX64Path ?? resolve(process.cwd(), "agent/runtime/linux-x64/node")),
+      arm64: resolve(options.agentRuntimeArm64Path ?? resolve(process.cwd(), "agent/runtime/linux-arm64/node")),
+    };
     this.maxConcurrent = boundedInteger(options.maxConcurrent, 2, 1, 8);
     this.preflightTtlMs = boundedInteger(options.preflightTtlMs, DEFAULT_PREFLIGHT_TTL_MS, 60_000, 30 * 60_000);
     this.bootstrapTimeoutMs = boundedInteger(options.bootstrapTimeoutMs, DEFAULT_BOOTSTRAP_TIMEOUT_MS, 30_000, 15 * 60_000);
@@ -1340,12 +1374,15 @@ export class BootstrapManager {
     job.progress = 5;
     job.startedAt = isoNow();
     let bundle: Buffer | null = null;
+    let managedRuntime: Buffer | null = null;
+    let managedRuntimeSha256: string | null = null;
     const token = randomBytes(32).toString("base64url");
     const safeJob = job.id.replace(/[^a-zA-Z0-9]/g, "");
     const tempBundle = shellSafePath(`/tmp/server-ops-agent-${safeJob}.cjs`);
     const tempConfig = shellSafePath(`/tmp/server-ops-agent-${safeJob}.json`);
     const tempEnv = shellSafePath(`/tmp/server-ops-agent-${safeJob}.env`);
     const tempService = shellSafePath(`/tmp/server-ops-agent-${safeJob}.service`);
+    const tempRuntime = shellSafePath(`/tmp/server-ops-agent-${safeJob}.node`);
     const backupDir = shellSafePath(`${AGENT_STATE_DIR}/.bootstrap-${safeJob}`);
     job.backupDir = backupDir;
     const config = Buffer.from(JSON.stringify({
@@ -1403,15 +1440,42 @@ export class BootstrapManager {
       if (Date.now() > deadline) throw new BootstrapError("SSH_TIMEOUT", "SSH bootstrap timed out", 504);
       const identity = await execRemote(client, "id -u", this.sshReadyTimeoutMs, job);
       if (identity.code !== 0 || identity.stdout.trim() !== "0") throw new BootstrapError("SSH_PRIVILEGE_REQUIRED", "SSH user must have root privileges", 403);
+      const systemd = await execRemote(client, "test -d /run/systemd/system", this.sshReadyTimeoutMs, job);
+      if (systemd.code !== 0) {
+        throw new BootstrapError("AGENT_RUNTIME_UNAVAILABLE", "Target server requires systemd", 422);
+      }
       const runtime = await execRemote(client,
-        "test -d /run/systemd/system && for candidate in /opt/server-ops-agent/node /usr/bin/node /usr/local/bin/node; do if test -x \"$candidate\" && \"$candidate\" -e \"process.exit(Number(process.versions.node.split('.')[0]) >= 22 ? 0 : 1)\"; then printf '%s' \"$candidate\"; exit 0; fi; done; exit 1",
+        "for candidate in /opt/server-ops-agent/node /usr/bin/node /usr/local/bin/node; do if test -x \"$candidate\" && \"$candidate\" -e \"process.exit(Number(process.versions.node.split('.')[0]) >= 22 ? 0 : 1)\"; then printf '%s' \"$candidate\"; exit 0; fi; done; exit 1",
         this.sshReadyTimeoutMs,
         job,
       );
-      if (runtime.code !== 0 || !/^\/(?:opt\/server-ops-agent\/node|usr\/bin\/node|usr\/local\/bin\/node)$/.test(runtime.stdout.trim())) {
-        throw new BootstrapError("AGENT_RUNTIME_UNAVAILABLE", "Target server requires systemd and Node.js 22 or newer at a supported path", 422);
+      const existingRuntime = runtime.code === 0 && /^\/(?:opt\/server-ops-agent\/node|usr\/bin\/node|usr\/local\/bin\/node)$/.test(runtime.stdout.trim())
+        ? runtime.stdout.trim()
+        : null;
+      if (existingRuntime) {
+        service = Buffer.from(fixedAgentService(existingRuntime), "utf8");
+      } else {
+        const machine = await execRemote(client, "uname -m", this.sshReadyTimeoutMs, job);
+        const architecture = machine.code === 0 ? agentArchitecture(machine.stdout) : null;
+        if (!architecture) {
+          throw new BootstrapError(
+            "AGENT_ARCHITECTURE_UNSUPPORTED",
+            `Target architecture is not supported: ${(machine.stdout.trim() || "unknown").slice(0, 80)}`,
+            422,
+          );
+        }
+        try { managedRuntime = readFileSync(this.agentRuntimePaths[architecture]); }
+        catch {
+          throw new BootstrapError(
+            "AGENT_RUNTIME_UNAVAILABLE",
+            `Managed Agent runtime for Linux ${architecture} is unavailable on the control plane`,
+            503,
+          );
+        }
+        validateManagedRuntime(managedRuntime, architecture);
+        managedRuntimeSha256 = createHash("sha256").update(managedRuntime).digest("hex");
+        service = Buffer.from(fixedAgentService(AGENT_MANAGED_RUNTIME), "utf8");
       }
-      service = Buffer.from(fixedAgentService(runtime.stdout.trim()), "utf8");
       // Mark the control-plane metadata as touched before the write. If the
       // SQLite call fails after a partial commit, the catch path must still
       // attempt remote cleanup and retain a recovery lock.
@@ -1426,11 +1490,32 @@ export class BootstrapManager {
       await writeSftp(client, tempConfig, config, 0o600, job);
       await writeSftp(client, tempEnv, env, 0o600, job);
       await writeSftp(client, tempService, service!, 0o644, job);
+      if (managedRuntime) {
+        await writeSftp(client, tempRuntime, managedRuntime, 0o700, job, 5 * 60_000);
+        const verifyRuntime = await execRemote(
+          client,
+          this.verifyRuntimeCommand(tempRuntime, managedRuntimeSha256!),
+          30_000,
+          job,
+        );
+        if (verifyRuntime.code !== 0) {
+          throw new BootstrapError("AGENT_RUNTIME_UNAVAILABLE", "Managed Agent runtime could not run on the target server", 422,
+            { output: truncateOutput(verifyRuntime.stderr || verifyRuntime.stdout) });
+        }
+      }
       job.stage = "installing_agent";
       job.progress = 55;
       this.requirePersist(job);
       this.assertNotCancelled(job);
-      const installCommand = this.installCommand({ tempBundle, tempConfig, tempEnv, tempService, backupDir });
+      const installCommand = this.installCommand({
+        tempBundle,
+        tempConfig,
+        tempEnv,
+        tempService,
+        tempRuntime: managedRuntime ? tempRuntime : null,
+        runtimeSha256: managedRuntimeSha256,
+        backupDir,
+      });
       const installResult = await execRemote(client, installCommand, 45_000, job);
       if (installResult.code !== 0) throw new BootstrapError("AGENT_INSTALL_FAILED", "Remote Agent installation failed", 502,
         { output: truncateOutput(installResult.stderr || installResult.stdout) });
@@ -1475,7 +1560,7 @@ export class BootstrapManager {
       try {
         await connectClient(cleanupClient, { ...connectConfig, password: secret });
         const cleanup = await execRemote(cleanupClient,
-          this.cleanupCommand({ backupDir, tempBundle, tempConfig, tempEnv, tempService }),
+          this.cleanupCommand({ backupDir, tempBundle, tempConfig, tempEnv, tempService, tempRuntime }),
           20_000,
           job,
         );
@@ -1540,7 +1625,17 @@ export class BootstrapManager {
         job.progress = Math.max(job.progress, 90);
         job.transportError = null;
         this.tryPersist(job);
-        const rolledBack = await this.rollback(job, { ...context, previous: context.previous, backupDir, tempBundle, tempConfig, tempEnv, tempService, secret });
+        const rolledBack = await this.rollback(job, {
+          ...context,
+          previous: context.previous,
+          backupDir,
+          tempBundle,
+          tempConfig,
+          tempEnv,
+          tempService,
+          tempRuntime,
+          secret,
+        });
         if (!rolledBack || job.remoteStateUncertain) {
           job.status = "rollback_unknown";
           job.stage = "recovery_required";
@@ -1577,10 +1672,34 @@ export class BootstrapManager {
     }
   }
 
-  private installCommand(paths: { tempBundle: string; tempConfig: string; tempEnv: string; tempService: string; backupDir: string }) {
+  private verifyRuntimeCommand(tempRuntime: string, runtimeSha256: string) {
+    const runtime = shellSafePath(tempRuntime);
+    const checksum = shellSafeSha256(runtimeSha256);
+    return `set -eu
+printf '%s  %s\n' ${checksum} ${runtime} | sha256sum -c - >/dev/null
+${runtime} -e "process.exit(Number(process.versions.node.split('.')[0]) >= 22 ? 0 : 1)"`;
+  }
+
+  private installCommand(paths: {
+    tempBundle: string;
+    tempConfig: string;
+    tempEnv: string;
+    tempService: string;
+    tempRuntime: string | null;
+    runtimeSha256: string | null;
+    backupDir: string;
+  }) {
     const b = shellSafePath(paths.tempBundle); const c = shellSafePath(paths.tempConfig);
     const e = shellSafePath(paths.tempEnv); const s = shellSafePath(paths.tempService); const backup = shellSafePath(paths.backupDir);
-    return `set -eu
+    const runtime = paths.tempRuntime ? shellSafePath(paths.tempRuntime) : null;
+    const runtimePreflight = runtime && paths.runtimeSha256 ? `${this.verifyRuntimeCommand(runtime, paths.runtimeSha256)}\n` : "";
+    const runtimeBackup = runtime
+      ? `if [ -e ${AGENT_MANAGED_RUNTIME} ]; then cp -a ${AGENT_MANAGED_RUNTIME} ${backup}/runtime; else touch ${backup}/runtime.missing; fi\n`
+      : "";
+    const runtimeInstall = runtime
+      ? `install -m 0755 ${runtime} ${AGENT_MANAGED_RUNTIME}.tmp\nmv -f ${AGENT_MANAGED_RUNTIME}.tmp ${AGENT_MANAGED_RUNTIME}\n`
+      : "";
+    return `${runtimePreflight}set -eu
 install -d -m 0755 ${AGENT_REMOTE_DIR} ${AGENT_CONFIG_DIR} ${AGENT_STATE_DIR}
 rm -rf ${backup}
 install -d -m 0700 ${backup}
@@ -1589,15 +1708,16 @@ if [ -e ${AGENT_REMOTE_DIR}/ops-agent.cjs ]; then cp -a ${AGENT_REMOTE_DIR}/ops-
 if [ -e ${AGENT_CONFIG_DIR}/agent.config.json ]; then cp -a ${AGENT_CONFIG_DIR}/agent.config.json ${backup}/config; else touch ${backup}/config.missing; fi
 if [ -e ${AGENT_CONFIG_DIR}/agent.env ]; then cp -a ${AGENT_CONFIG_DIR}/agent.env ${backup}/env; else touch ${backup}/env.missing; fi
 if [ -e /etc/systemd/system/${AGENT_SERVICE} ]; then cp -a /etc/systemd/system/${AGENT_SERVICE} ${backup}/service; else touch ${backup}/service.missing; fi
+${runtimeBackup}systemctl stop ${AGENT_SERVICE} 2>/dev/null || true
 install -m 0755 ${b} ${AGENT_REMOTE_DIR}/ops-agent.cjs.tmp
 install -m 0600 ${c} ${AGENT_CONFIG_DIR}/agent.config.json.tmp
 install -m 0600 ${e} ${AGENT_CONFIG_DIR}/agent.env.tmp
 install -m 0644 ${s} /etc/systemd/system/${AGENT_SERVICE}.tmp
-mv -f ${AGENT_REMOTE_DIR}/ops-agent.cjs.tmp ${AGENT_REMOTE_DIR}/ops-agent.cjs
+${runtimeInstall}mv -f ${AGENT_REMOTE_DIR}/ops-agent.cjs.tmp ${AGENT_REMOTE_DIR}/ops-agent.cjs
 mv -f ${AGENT_CONFIG_DIR}/agent.config.json.tmp ${AGENT_CONFIG_DIR}/agent.config.json
 mv -f ${AGENT_CONFIG_DIR}/agent.env.tmp ${AGENT_CONFIG_DIR}/agent.env
 mv -f /etc/systemd/system/${AGENT_SERVICE}.tmp /etc/systemd/system/${AGENT_SERVICE}
-rm -f ${b} ${c} ${e} ${s}
+rm -f ${b} ${c} ${e} ${s}${runtime ? ` ${runtime}` : ""}
 systemctl daemon-reload
 systemctl enable ops-agent.service`;
   }
@@ -1608,9 +1728,9 @@ systemctl restart ${AGENT_SERVICE}
 systemctl is-active --quiet ${AGENT_SERVICE}`;
   }
 
-  private cleanupCommand(paths: { backupDir: string; tempBundle: string; tempConfig: string; tempEnv: string; tempService: string }) {
+  private cleanupCommand(paths: { backupDir: string; tempBundle: string; tempConfig: string; tempEnv: string; tempService: string; tempRuntime: string }) {
     return `set -eu
-rm -rf ${shellSafePath(paths.backupDir)} ${shellSafePath(paths.tempBundle)} ${shellSafePath(paths.tempConfig)} ${shellSafePath(paths.tempEnv)} ${shellSafePath(paths.tempService)}`;
+rm -rf ${shellSafePath(paths.backupDir)} ${shellSafePath(paths.tempBundle)} ${shellSafePath(paths.tempConfig)} ${shellSafePath(paths.tempEnv)} ${shellSafePath(paths.tempService)} ${shellSafePath(paths.tempRuntime)}`;
   }
 
   private async rollback(job: BootstrapJob, context: {
@@ -1625,6 +1745,7 @@ rm -rf ${shellSafePath(paths.backupDir)} ${shellSafePath(paths.tempBundle)} ${sh
     tempConfig: string;
     tempEnv: string;
     tempService: string;
+    tempRuntime: string;
     secret: string;
   }) {
     if (job.connection) {
@@ -1658,10 +1779,11 @@ if [ -d ${backup} ]; then
   if [ -e ${backup}/config.missing ]; then rm -f ${AGENT_CONFIG_DIR}/agent.config.json; else cp -a ${backup}/config ${AGENT_CONFIG_DIR}/agent.config.json; fi
   if [ -e ${backup}/env.missing ]; then rm -f ${AGENT_CONFIG_DIR}/agent.env; else cp -a ${backup}/env ${AGENT_CONFIG_DIR}/agent.env; fi
   if [ -e ${backup}/service.missing ]; then rm -f /etc/systemd/system/${AGENT_SERVICE}; else cp -a ${backup}/service /etc/systemd/system/${AGENT_SERVICE}; fi
+  if [ -e ${backup}/runtime.missing ]; then rm -f ${AGENT_MANAGED_RUNTIME}; elif [ -e ${backup}/runtime ]; then cp -a ${backup}/runtime ${AGENT_MANAGED_RUNTIME}; fi
   systemctl daemon-reload
   if [ -e ${backup}/service.missing ]; then systemctl disable ${AGENT_SERVICE} || true; else systemctl enable --now ${AGENT_SERVICE}; systemctl is-active --quiet ${AGENT_SERVICE}; fi
 fi
-rm -rf ${backup} ${shellSafePath(context.tempBundle)} ${shellSafePath(context.tempConfig)} ${shellSafePath(context.tempEnv)} ${shellSafePath(context.tempService)}`;
+rm -rf ${backup} ${shellSafePath(context.tempBundle)} ${shellSafePath(context.tempConfig)} ${shellSafePath(context.tempEnv)} ${shellSafePath(context.tempService)} ${shellSafePath(context.tempRuntime)} ${AGENT_MANAGED_RUNTIME}.tmp`;
       const result = await execRemote(client, command, 45_000, job, { ignoreCancellation: true });
       if (result.code !== 0) throw new Error("rollback command failed");
       if (job.installedAgentTokenHash) {

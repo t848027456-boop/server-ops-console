@@ -44,6 +44,8 @@ export interface OpsServerOptions {
   logger?: Pick<Console, "info" | "warn" | "error">;
   agentControlPlaneUrl?: string;
   agentBundlePath?: string;
+  agentRuntimeX64Path?: string;
+  agentRuntimeArm64Path?: string;
   bootstrapMaxConcurrent?: number;
   bootstrapTimeoutMs?: number;
   sshReadyTimeoutMs?: number;
@@ -305,6 +307,8 @@ export function createOpsServer(options: OpsServerOptions) {
     audit,
     agentControlPlaneUrl: options.agentControlPlaneUrl,
     agentBundlePath: options.agentBundlePath,
+    agentRuntimeX64Path: options.agentRuntimeX64Path,
+    agentRuntimeArm64Path: options.agentRuntimeArm64Path,
     maxConcurrent: options.bootstrapMaxConcurrent,
     bootstrapTimeoutMs: options.bootstrapTimeoutMs,
     sshReadyTimeoutMs: options.sshReadyTimeoutMs,

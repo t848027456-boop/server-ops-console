@@ -29,8 +29,10 @@ OPS_HEARTBEAT_TIMEOUT_MS=45000
 OPS_ALLOW_INSECURE_LOCAL=0
 OPS_AGENT_CONTROL_PLANE_URL=wss://ops.example.com/api/v1/agent/ws
 OPS_AGENT_BUNDLE_PATH=agent/dist/ops-agent.cjs
+OPS_AGENT_RUNTIME_X64_PATH=agent/runtime/linux-x64/node
+OPS_AGENT_RUNTIME_ARM64_PATH=agent/runtime/linux-arm64/node
 OPS_BOOTSTRAP_MAX_CONCURRENT=2
-OPS_BOOTSTRAP_TIMEOUT_MS=180000
+OPS_BOOTSTRAP_TIMEOUT_MS=600000
 OPS_SSH_READY_TIMEOUT_MS=15000
 OPS_BOOTSTRAP_ALLOW_PRIVATE_ADDRESSES=0
 OPS_BOOTSTRAP_ALLOW_HOSTNAMES=0
@@ -89,6 +91,10 @@ SSH bootstrap is a short-lived installation path, not a long-term password store
 After confirmation, call `POST /api/v1/servers/bootstrap` with the same target, `preflightId`, `hostKeyFingerprint`, server `name`, and `password`, plus a required unique `Idempotency-Key` header (8-200 characters). The server `id` is optional: when omitted, the control plane generates a stable `srv-<uuid>` identifier and uses it for the bootstrap job, persisted server, and installed Agent configuration. A supplied custom `id` must contain 2-64 URL-safe ASCII characters. The display `name` is independent from the identifier and accepts Unicode, including Chinese names such as `US大鸡`.
 
 An address that is already registered to a server is rejected with `BOOTSTRAP_ALREADY_ENROLLED`; manage the existing server instead of running SSH bootstrap again. The password is removed from the parsed request immediately and is never written to SQLite, audit events, job state, logs, URLs, environment variables, or command arguments. The worker uploads the bundled Agent, a token-only environment file, its config, and a fixed systemd unit; success requires a fresh Agent heartbeat from the new Agent session.
+
+The worker first uses an executable Node.js 22 or newer at `/opt/server-ops-agent/node`, `/usr/bin/node`, or `/usr/local/bin/node`. Otherwise it maps `uname -m` to x64 or arm64 and uploads the matching file configured by `OPS_AGENT_RUNTIME_X64_PATH` or `OPS_AGENT_RUNTIME_ARM64_PATH`. It validates the local ELF architecture, verifies the uploaded SHA-256 digest, and executes a Node.js 22 compatibility check before atomically installing `/opt/server-ops-agent/node`. The Docker image supplies both defaults; source checkouts must provide a trusted binary at a configured path when testing the no-Node bootstrap path.
+
+Managed runtimes are limited to systemd-based glibc Linux on x64 and arm64, with Debian and Ubuntu as the supported product targets. The bootstrap does not install Node through a package manager and does not modify a pre-existing system Node.js. Unsupported architectures, missing runtime assets, and incompatible binaries fail closed with stable bootstrap errors.
 
 Production bootstrap requires a `wss://` control-plane URL. Set `OPS_AGENT_CONTROL_PLANE_URL` on the server and set `OPS_TRUST_PROXY=1` only when a trusted TLS reverse proxy terminates HTTPS and forwards `X-Forwarded-Proto`. `OPS_ALLOW_INSECURE_LOCAL=1` is limited to a loopback development process.
 
