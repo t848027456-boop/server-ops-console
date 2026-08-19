@@ -18,6 +18,7 @@ export interface BootstrapPreflightRow {
 export interface BootstrapJobRow {
   id: string;
   idempotency_key: string | null;
+  request_hash?: string | null;
   status: string;
   server_id: string;
   host: string;
@@ -43,6 +44,17 @@ export interface BootstrapJobRow {
   server_metadata_touched: number;
   installed_agent_token_hash: string | null;
   backup_dir: string;
+}
+
+export interface BootstrapEnrollmentRow {
+  server_id: string;
+  bootstrap_job_id: string;
+  host: string;
+  connect_host: string;
+  port: number;
+  username: string;
+  created_at: string;
+  updated_at: string;
 }
 
 export interface BootstrapRecoveryLockRow {
@@ -197,6 +209,7 @@ export class OpsDatabase {
       CREATE TABLE IF NOT EXISTS bootstrap_jobs (
         id TEXT PRIMARY KEY,
         idempotency_key TEXT UNIQUE,
+        request_hash TEXT,
         status TEXT NOT NULL,
         server_id TEXT NOT NULL,
         host TEXT NOT NULL,
@@ -224,6 +237,18 @@ export class OpsDatabase {
         backup_dir TEXT NOT NULL DEFAULT ''
       );
 
+      CREATE TABLE IF NOT EXISTS bootstrap_enrollments (
+        server_id TEXT PRIMARY KEY,
+        bootstrap_job_id TEXT NOT NULL,
+        host TEXT NOT NULL,
+        connect_host TEXT NOT NULL,
+        port INTEGER NOT NULL,
+        username TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(host, port, username)
+      );
+
       CREATE TABLE IF NOT EXISTS bootstrap_recovery_locks (
         server_id TEXT PRIMARY KEY,
         bootstrap_job_id TEXT NOT NULL,
@@ -248,6 +273,8 @@ export class OpsDatabase {
       CREATE INDEX IF NOT EXISTS idx_bootstrap_preflights_expires ON bootstrap_preflights(expires_at);
       CREATE INDEX IF NOT EXISTS idx_bootstrap_jobs_created ON bootstrap_jobs(created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_bootstrap_jobs_server_status ON bootstrap_jobs(server_id, status);
+      CREATE INDEX IF NOT EXISTS idx_bootstrap_enrollments_connect_target
+        ON bootstrap_enrollments(connect_host, port, username);
       CREATE INDEX IF NOT EXISTS idx_bootstrap_recovery_locks_active_target
         ON bootstrap_recovery_locks(connect_host, port, cleared_at);
     `);
@@ -262,6 +289,10 @@ export class OpsDatabase {
     if (!taskColumns.some((column) => column.name === "cancel_requested")) {
       this.sqlite.exec("ALTER TABLE tasks ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0");
     }
+    const bootstrapJobColumns = this.sqlite.prepare("PRAGMA table_info(bootstrap_jobs)").all() as Array<{ name: string }>;
+    if (!bootstrapJobColumns.some((column) => column.name === "request_hash")) {
+      this.sqlite.exec("ALTER TABLE bootstrap_jobs ADD COLUMN request_hash TEXT");
+    }
     // Upgrade databases created before recovery locks existed. A retained row
     // also records a later explicit clear, so this backfill cannot re-lock it.
     this.sqlite.exec(`
@@ -275,6 +306,19 @@ export class OpsDatabase {
       FROM bootstrap_jobs
       WHERE status = 'rollback_unknown'
         AND (stage = 'recovery_required' OR remote_state_uncertain = 1)
+    `);
+    // Successful SSH targets remain protected after old job history is pruned.
+    // Latest rows win when an older database already contains duplicate targets.
+    this.sqlite.exec(`
+      INSERT OR IGNORE INTO bootstrap_enrollments (
+        server_id, bootstrap_job_id, host, connect_host, port, username, created_at, updated_at
+      )
+      SELECT jobs.server_id, jobs.id, jobs.host, jobs.connect_host, jobs.port, jobs.username,
+        COALESCE(jobs.finished_at, jobs.updated_at), jobs.updated_at
+      FROM bootstrap_jobs jobs
+      JOIN servers ON servers.id = jobs.server_id
+      WHERE jobs.status = 'succeeded'
+      ORDER BY jobs.updated_at DESC
     `);
   }
 
@@ -320,14 +364,16 @@ export class OpsDatabase {
   upsertBootstrapJob(input: BootstrapJobRow) {
     this.sqlite.prepare(`
       INSERT INTO bootstrap_jobs (
-        id, idempotency_key, status, server_id, host, connect_host, port, username,
+        id, idempotency_key, request_hash, status, server_id, host, connect_host, port, username,
         host_key_fingerprint, host_key_type, stage, progress, created_at, started_at,
         finished_at, updated_at, cancel_requested, error_code, error, rollback_attempted,
         heartbeat_at, previous_agent_token_hash, heartbeat_before, remote_state_uncertain,
         server_metadata_touched, installed_agent_token_hash, backup_dir
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
-        idempotency_key = excluded.idempotency_key, status = excluded.status,
+        idempotency_key = excluded.idempotency_key,
+        request_hash = COALESCE(excluded.request_hash, bootstrap_jobs.request_hash),
+        status = excluded.status,
         server_id = excluded.server_id, host = excluded.host, connect_host = excluded.connect_host,
         port = excluded.port, username = excluded.username,
         host_key_fingerprint = excluded.host_key_fingerprint, host_key_type = excluded.host_key_type,
@@ -341,7 +387,7 @@ export class OpsDatabase {
         installed_agent_token_hash = excluded.installed_agent_token_hash,
         backup_dir = excluded.backup_dir
     `).run(
-      input.id, input.idempotency_key, input.status, input.server_id, input.host, input.connect_host,
+      input.id, input.idempotency_key, input.request_hash ?? null, input.status, input.server_id, input.host, input.connect_host,
       input.port, input.username, input.host_key_fingerprint, input.host_key_type, input.stage,
       input.progress, input.created_at, input.started_at, input.finished_at, input.updated_at,
       input.cancel_requested, input.error_code, input.error, input.rollback_attempted,
@@ -361,6 +407,28 @@ export class OpsDatabase {
 
   getBootstrapJobByIdempotencyKey(key: string) {
     return this.sqlite.prepare("SELECT * FROM bootstrap_jobs WHERE idempotency_key = ?").get(key) as BootstrapJobRow | undefined;
+  }
+
+  recordBootstrapEnrollment(input: BootstrapEnrollmentRow) {
+    this.sqlite.prepare(`
+      INSERT INTO bootstrap_enrollments (
+        server_id, bootstrap_job_id, host, connect_host, port, username, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      input.server_id, input.bootstrap_job_id, input.host, input.connect_host,
+      input.port, input.username, input.created_at, input.updated_at,
+    );
+    return this.getBootstrapEnrollmentByServerId(input.server_id)!;
+  }
+
+  getBootstrapEnrollmentByServerId(serverId: string) {
+    return this.sqlite.prepare("SELECT * FROM bootstrap_enrollments WHERE server_id = ?").get(serverId) as BootstrapEnrollmentRow | undefined;
+  }
+
+  getBootstrapEnrollmentByTarget(host: string, port: number, username: string) {
+    return this.sqlite.prepare(`
+      SELECT * FROM bootstrap_enrollments WHERE host = ? AND port = ? AND username = ?
+    `).get(host, port, username) as BootstrapEnrollmentRow | undefined;
   }
 
   upsertBootstrapRecoveryLock(input: BootstrapRecoveryLockRow) {
@@ -469,6 +537,15 @@ export class OpsDatabase {
 
   getServer(id: string) {
     return this.sqlite.prepare("SELECT * FROM servers WHERE id = ?").get(id) as ServerRow | undefined;
+  }
+
+  getServerByAddress(address: string) {
+    return this.sqlite.prepare(`
+      SELECT * FROM servers
+      WHERE address <> '' AND lower(trim(address)) = lower(trim(?))
+      ORDER BY created_at ASC
+      LIMIT 1
+    `).get(address) as ServerRow | undefined;
   }
 
   listServers() {

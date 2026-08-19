@@ -122,6 +122,7 @@ const address = app.httpServer.address();
 assert(address && typeof address === "object");
 let baseUrl = `http://127.0.0.1:${address.port}`;
 bootstrapBaseUrl = baseUrl;
+const originalControlPlaneUrl = baseUrl;
 
 async function api(path, options = {}, expectedStatus = 200) {
   const headers = new Headers(options.headers);
@@ -283,6 +284,33 @@ try {
   assert.equal(bootstrapReplay.data.id, bootstrapStarted.data.id);
   assert.equal(bootstrapReplay.data.serverId, bootstrapStarted.data.serverId);
   assert.equal(bootstrapReplay.idempotentReplay, true);
+  const bootstrapJobsBeforeMismatchedReplays = app.db.listBootstrapJobs().length;
+  const replayMetadataMutations = [
+    { field: "name", patch: { name: "另一台服务器" } },
+    { field: "region", patch: { region: "美国" } },
+    { field: "os", patch: { os: "Debian 13" } },
+    { field: "controlPlaneUrl", patch: { controlPlaneUrl: `http://127.0.0.1:${address.port + 1}` } },
+  ];
+  for (const mutation of replayMetadataMutations) {
+    const mismatchedReplay = await api("/api/v1/servers/bootstrap", {
+      method: "POST",
+      headers: { "content-type": "application/json", "idempotency-key": "bootstrap-success-001" },
+      body: JSON.stringify({
+        preflightId: bootstrapPreflight.data.id,
+        address: "203.0.113.10",
+        sshPort: 2222,
+        sshUsername: "root",
+        hostKeyFingerprint: bootstrapPreflight.data.hostKeyFingerprint,
+        password: "bootstrap smoke password",
+        name: "US大鸡",
+        controlPlaneUrl: baseUrl,
+        ...mutation.patch,
+      }),
+    }, 409);
+    assert.equal(mismatchedReplay.error.code, "BOOTSTRAP_INVALID", mutation.field);
+    assert.equal(mismatchedReplay.error.details.field, "idempotencyKey", mutation.field);
+  }
+  assert.equal(app.db.listBootstrapJobs().length, bootstrapJobsBeforeMismatchedReplays);
   let bootstrapJob;
   for (let attempt = 0; attempt < 500; attempt += 1) {
     bootstrapJob = await api(`/api/v1/servers/bootstrap/${bootstrapStarted.data.id}`);
@@ -302,7 +330,7 @@ try {
   const enrollment = await api("/api/v1/servers/enrollment-token", {
     method: "POST",
     headers: { "content-type": "application/json", "x-ops-actor": "smoke-test" },
-    body: JSON.stringify({ id: "smoke-server", name: "Smoke Server", region: "local", os: "Debian 12" }),
+    body: JSON.stringify({ id: "smoke-server", name: "Smoke Server", region: "local", address: "2001:DB8::12", os: "Debian 12" }),
   }, 201);
   assert(enrollment.data.agentToken);
 
@@ -321,6 +349,69 @@ try {
     }),
   }, 201);
   assert.equal(project.data.type, "Compose");
+
+  const registeredServerBeforeDuplicate = app.db.getServer("smoke-server");
+  const registeredProjectBeforeDuplicate = app.db.getProject("smoke-project");
+  const bootstrapJobsBeforeRegisteredDuplicate = app.db.listBootstrapJobs().length;
+  const uploadsBeforeRegisteredDuplicate = [...bootstrapUploads.entries()].map(([path, content]) => [path, content.toString("base64")]);
+  const registeredDuplicatePreflight = await api("/api/v1/servers/bootstrap/preflight", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ address: "2001:db8::12", sshPort: 2222, sshUsername: "root" }),
+  });
+  const registeredDuplicate = await api("/api/v1/servers/bootstrap", {
+    method: "POST",
+    headers: { "content-type": "application/json", "idempotency-key": "bootstrap-registered-address-001" },
+    body: JSON.stringify({
+      preflightId: registeredDuplicatePreflight.data.id,
+      address: "2001:db8::12",
+      sshPort: 2222,
+      sshUsername: "root",
+      hostKeyFingerprint: registeredDuplicatePreflight.data.hostKeyFingerprint,
+      password: "bootstrap smoke password",
+      id: "replacement-server",
+      name: "Replacement Server",
+      controlPlaneUrl: baseUrl,
+    }),
+  }, 409);
+  assert.equal(registeredDuplicate.error.code, "BOOTSTRAP_ALREADY_ENROLLED");
+  assert.equal(registeredDuplicate.error.details.serverId, "smoke-server");
+  assert.equal(registeredDuplicate.error.details.name, "Smoke Server");
+  assert.equal(JSON.stringify(app.db.getServer("smoke-server")), JSON.stringify(registeredServerBeforeDuplicate));
+  assert.equal(app.db.getServer("smoke-server").agent_token_hash, registeredServerBeforeDuplicate.agent_token_hash);
+  assert.equal(JSON.stringify(app.db.getProject("smoke-project")), JSON.stringify(registeredProjectBeforeDuplicate));
+  assert.equal(app.db.getProject("smoke-project").server_id, "smoke-server");
+  assert.equal(app.db.getServer("replacement-server"), undefined);
+  assert.equal(app.db.listBootstrapJobs().length, bootstrapJobsBeforeRegisteredDuplicate);
+  assert.deepEqual([...bootstrapUploads.entries()].map(([path, content]) => [path, content.toString("base64")]), uploadsBeforeRegisteredDuplicate);
+  assert.equal(app.db.listBootstrapPreflights().some((row) => row.id === registeredDuplicatePreflight.data.id), true);
+
+  const registeredIdPreflight = await api("/api/v1/servers/bootstrap/preflight", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ address: "2001:db8::13", sshPort: 2222, sshUsername: "root" }),
+  });
+  const registeredIdDuplicate = await api("/api/v1/servers/bootstrap", {
+    method: "POST",
+    headers: { "content-type": "application/json", "idempotency-key": "bootstrap-registered-id-001" },
+    body: JSON.stringify({
+      preflightId: registeredIdPreflight.data.id,
+      address: "2001:db8::13",
+      sshPort: 2222,
+      sshUsername: "root",
+      hostKeyFingerprint: registeredIdPreflight.data.hostKeyFingerprint,
+      password: "bootstrap smoke password",
+      id: "smoke-server",
+      name: "Replacement Server",
+      controlPlaneUrl: baseUrl,
+    }),
+  }, 409);
+  assert.equal(registeredIdDuplicate.error.code, "BOOTSTRAP_ALREADY_ENROLLED");
+  assert.equal(registeredIdDuplicate.error.details.serverId, "smoke-server");
+  assert.equal(JSON.stringify(app.db.getServer("smoke-server")), JSON.stringify(registeredServerBeforeDuplicate));
+  assert.equal(JSON.stringify(app.db.getProject("smoke-project")), JSON.stringify(registeredProjectBeforeDuplicate));
+  assert.equal(app.db.listBootstrapJobs().length, bootstrapJobsBeforeRegisteredDuplicate);
+  assert.equal(app.db.listBootstrapPreflights().some((row) => row.id === registeredIdPreflight.data.id), true);
 
   await api("/api/v1/projects", {
     method: "POST",
@@ -785,8 +876,8 @@ try {
       sshUsername: "root",
       hostKeyFingerprint: bootstrapPreflight.data.hostKeyFingerprint,
       password: "bootstrap smoke password",
-      id: bootstrapStarted.data.serverId,
-      controlPlaneUrl: baseUrl,
+      name: "US大鸡",
+      controlPlaneUrl: originalControlPlaneUrl,
     }),
   });
   assert.equal(terminalReplay.idempotentReplay, true);

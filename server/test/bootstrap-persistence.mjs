@@ -27,6 +27,14 @@ db.upsertBootstrapPreflight({
   created_at: createdAt,
   expires_at: future,
 });
+db.upsertServer({
+  id: "srv-restart-1",
+  name: "Restart Smoke",
+  region: "test",
+  address: "203.0.113.10",
+  os: "Debian 12",
+  agentTokenHash: "old-token-hash",
+});
 db.upsertBootstrapJob({
   id: "bootstrap-restart-1",
   idempotency_key: "bootstrap-restart-key",

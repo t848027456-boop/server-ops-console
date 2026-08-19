@@ -428,9 +428,24 @@ function bootstrapVisualStage(job: BootstrapJob) {
 }
 
 function bootstrapError(reason: unknown, fallback: string, secret = "") {
-  if (reason instanceof ApiError && reason.code === "BOOTSTRAP_INVALID") {
+  if (reason instanceof ApiError) {
     const details = reason.details && typeof reason.details === "object" ? reason.details as Record<string, unknown> : null;
-    if (details?.field === "serverId") return "服务器内部标识无效，请刷新页面后重新接入";
+    if (reason.code === "BOOTSTRAP_INVALID" && details?.field === "serverId") {
+      return "服务器内部标识无效，请刷新页面后重新接入";
+    }
+    if (reason.code === "BOOTSTRAP_ALREADY_ENROLLED") {
+      const serverId = typeof details?.serverId === "string" && /^[a-zA-Z0-9][a-zA-Z0-9._-]{1,63}$/.test(details.serverId)
+        ? details.serverId
+        : "";
+      const rawName = typeof details?.name === "string" ? details.name.trim() : "";
+      const safeName = rawName && !/[\u0000-\u001f\u007f]/.test(rawName)
+        ? (rawName.length > 48 ? `${rawName.slice(0, 47)}...` : rawName)
+        : "";
+      const existingServer = safeName ? `“${safeName}”${serverId ? `（${serverId}）` : ""}` : serverId;
+      return existingServer
+        ? `该主机地址已接入为 ${existingServer}，请直接在服务器列表中管理，无需重复安装`
+        : "该主机地址已经接入控制端，请直接在服务器列表中管理，无需重复安装";
+    }
   }
   let message = reason instanceof Error ? reason.message : fallback;
   if (/^(?:serverId is invalid|serverId must be 2-64 URL-safe characters)$/i.test(message)) {

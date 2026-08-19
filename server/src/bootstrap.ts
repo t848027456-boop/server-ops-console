@@ -27,6 +27,7 @@ export type BootstrapStatus = (typeof bootstrapStatuses)[number];
 export type BootstrapErrorCode =
   | "BOOTSTRAP_INVALID"
   | "BOOTSTRAP_BUSY"
+  | "BOOTSTRAP_ALREADY_ENROLLED"
   | "BOOTSTRAP_NOT_FOUND"
   | "BOOTSTRAP_EXPIRED"
   | "BOOTSTRAP_RECOVERY_REQUIRED"
@@ -108,6 +109,7 @@ interface BootstrapJob extends BootstrapJobView {
   idempotencyKey: string | null;
   backupDir: string;
   remoteTouched: boolean;
+  requestHash: string | null;
 }
 
 interface PreflightRecord {
@@ -393,6 +395,38 @@ function normalizeControlPlaneUrl(value: string | undefined, allowInsecure: bool
   }
   parsed.search = "";
   return parsed.toString();
+}
+
+interface BootstrapRequestIdentity {
+  host: string;
+  connectHost: string;
+  port: number;
+  username: string;
+  hostKeyFingerprint: string;
+  hostKeyType: string;
+  serverId: string;
+  serverName: string;
+  region: string;
+  os: string;
+  controlPlaneUrl: string;
+}
+
+function bootstrapRequestHash(input: BootstrapRequestIdentity) {
+  const normalized = [
+    "bootstrap-request-v1",
+    input.host,
+    input.connectHost,
+    input.port,
+    input.username,
+    input.hostKeyFingerprint,
+    input.hostKeyType,
+    input.serverId,
+    input.serverName,
+    input.region,
+    input.os,
+    input.controlPlaneUrl,
+  ];
+  return createHash("sha256").update(JSON.stringify(normalized)).digest("hex");
 }
 
 function truncateOutput(value: string) {
@@ -771,6 +805,7 @@ export class BootstrapManager {
       idempotencyKey: row.idempotency_key,
       backupDir: row.backup_dir || "",
       remoteTouched: Boolean(row.remote_state_uncertain || row.server_metadata_touched || row.backup_dir),
+      requestHash: row.request_hash ?? null,
     };
   }
 
@@ -779,6 +814,7 @@ export class BootstrapManager {
     this.db.upsertBootstrapJob({
       id: job.id,
       idempotency_key: job.idempotencyKey,
+      request_hash: job.requestHash,
       status: job.status,
       server_id: job.serverId,
       host: job.host,
@@ -1091,6 +1127,23 @@ export class BootstrapManager {
       throw new BootstrapError("BOOTSTRAP_INVALID", "password is required and must be at most 4096 characters", 400);
     }
     const requestedServerId = input.serverId ? safeId(input.serverId, "serverId") : undefined;
+    const controlPlaneUrl = normalizeControlPlaneUrl(input.controlPlaneUrl ?? this.agentControlPlaneUrl, this.allowInsecureControlPlane);
+    const serverName = input.serverName ? safeText(input.serverName, "serverName", 120) : host;
+    const region = input.region ? safeText(input.region, "region", 120) : "";
+    const os = input.os ? safeText(input.os, "os", 120) : "";
+    const requestHashFor = (serverId: string, connectHost: string, hostKeyType: string) => bootstrapRequestHash({
+      host,
+      connectHost,
+      port,
+      username,
+      hostKeyFingerprint: fingerprint,
+      hostKeyType,
+      serverId,
+      serverName,
+      region,
+      os,
+      controlPlaneUrl,
+    });
     let existingId = this.idempotency.get(idempotencyKey);
     if (!existingId) {
       const persisted = this.db.getBootstrapJobByIdempotencyKey(idempotencyKey);
@@ -1114,14 +1167,21 @@ export class BootstrapManager {
         this.jobs.set(restored.id, restored);
         return restored;
       })();
-      if (existing && (existing.host !== host || existing.port !== port || existing.username !== username
-        || !fingerprintEqual(existing.hostKeyFingerprint, fingerprint)
-        || (requestedServerId !== undefined && existing.serverId !== requestedServerId))) {
-        throw new BootstrapError("BOOTSTRAP_INVALID", "Idempotency-Key was already used for a different bootstrap target", 409);
+      if (existing) {
+        const effectiveServerId = requestedServerId ?? existing.serverId;
+        const requestHash = requestHashFor(effectiveServerId, existing.connectHost, existing.hostKeyType);
+        const legacyMismatch = !existing.requestHash && (existing.host !== host || existing.port !== port || existing.username !== username
+          || !fingerprintEqual(existing.hostKeyFingerprint, fingerprint)
+          || (requestedServerId !== undefined && existing.serverId !== requestedServerId));
+        if ((existing.requestHash && existing.requestHash !== requestHash) || legacyMismatch) {
+          throw new BootstrapError("BOOTSTRAP_INVALID",
+            "Idempotency-Key was already used with different bootstrap parameters", 409, { field: "idempotencyKey" });
+        }
+        return { job: this.view(existing), existing: true };
       }
-      if (existing) return { job: this.view(existing), existing: true };
       this.idempotency.delete(idempotencyKey);
     }
+
     const preflight = this.preflights.get(preflightId);
     if (!preflight) throw new BootstrapError("BOOTSTRAP_EXPIRED", "SSH preflight was not found or has expired", 409);
     if (Date.parse(preflight.expiresAt) <= Date.now()) {
@@ -1136,7 +1196,6 @@ export class BootstrapManager {
       throw new BootstrapError("SSH_HOST_KEY_MISMATCH", "Confirmed host key fingerprint does not match preflight", 409,
         { expectedFingerprint: preflight.fingerprint });
     }
-    const serverId = requestedServerId ?? `srv-${randomUUID()}`;
     const recoveryLock = this.findRecoveryLock(requestedServerId, host, preflight.connectHost, port);
     if (recoveryLock) {
       throw new BootstrapError("BOOTSTRAP_RECOVERY_REQUIRED",
@@ -1147,7 +1206,35 @@ export class BootstrapManager {
           port: recoveryLock.port,
         });
     }
-    const controlPlaneUrl = normalizeControlPlaneUrl(input.controlPlaneUrl ?? this.agentControlPlaneUrl, this.allowInsecureControlPlane);
+
+    const enrolled = this.db.getBootstrapEnrollmentByTarget(host, port, username)
+      ?? (requestedServerId ? this.db.getBootstrapEnrollmentByServerId(requestedServerId) : undefined);
+    if (enrolled) {
+      const server = this.db.getServer(enrolled.server_id);
+      throw new BootstrapError("BOOTSTRAP_ALREADY_ENROLLED",
+        "SSH target is already enrolled; use the existing server instead of creating a new identity", 409, {
+          serverId: enrolled.server_id,
+          ...(server?.name ? { name: server.name } : {}),
+          bootstrapJobId: enrolled.bootstrap_job_id,
+          host: enrolled.host,
+          port: enrolled.port,
+          username: enrolled.username,
+        });
+    }
+
+    const registeredServer = (requestedServerId ? this.db.getServer(requestedServerId) : undefined)
+      ?? this.db.getServerByAddress(host);
+    if (registeredServer) {
+      throw new BootstrapError("BOOTSTRAP_ALREADY_ENROLLED",
+        "Server identity or SSH target is already registered; use the existing server instead of creating a new identity", 409, {
+          serverId: registeredServer.id,
+          name: registeredServer.name,
+          host,
+        });
+    }
+
+    const serverId = requestedServerId ?? `srv-${randomUUID()}`;
+    const requestHash = requestHashFor(serverId, preflight.connectHost, preflight.hostKeyType);
     if (this.agentControlPlaneUrl) {
       const configuredUrl = normalizeControlPlaneUrl(this.agentControlPlaneUrl, this.allowInsecureControlPlane);
       if (configuredUrl !== controlPlaneUrl) {
@@ -1155,9 +1242,6 @@ export class BootstrapManager {
       }
     }
     if (!existsSync(this.agentBundlePath)) throw new BootstrapError("AGENT_BUNDLE_UNAVAILABLE", "Bundled Agent is unavailable on the control plane", 503);
-    const serverName = input.serverName ? safeText(input.serverName, "serverName", 120) : host;
-    const region = input.region ? safeText(input.region, "region", 120) : "";
-    const os = input.os ? safeText(input.os, "os", 120) : "";
     const targetKey = `${host}:${port}`;
     if (this.activeCount >= this.maxConcurrent || [...this.jobs.values()].some((job) => !job.finishedAt && `${job.host}:${job.port}` === targetKey)) {
       throw new BootstrapError("BOOTSTRAP_BUSY", "An SSH bootstrap is already running for this host", 429);
@@ -1201,6 +1285,7 @@ export class BootstrapManager {
       idempotencyKey,
       backupDir: "",
       remoteTouched: false,
+      requestHash,
     };
     this.db.transaction(() => {
       this.db.deleteBootstrapPreflight(preflightId);
@@ -1404,7 +1489,26 @@ export class BootstrapManager {
       job.errorCode = null;
       job.error = null;
       job.finishedAt = isoNow();
-      if (this.tryPersist(job, "completed")) {
+      let completionPersisted = false;
+      try {
+        this.db.transaction(() => {
+          this.persist(job);
+          this.db.recordBootstrapEnrollment({
+            server_id: job.serverId,
+            bootstrap_job_id: job.id,
+            host: job.host,
+            connect_host: job.connectHost,
+            port: job.port,
+            username: job.username,
+            created_at: job.finishedAt!,
+            updated_at: job.updatedAt,
+          });
+        });
+        completionPersisted = true;
+      } catch (error) {
+        this.logger.error(`Could not persist completed SSH bootstrap ${job.id} enrollment`, error);
+      }
+      if (completionPersisted) {
         this.tryAudit({ action: "server.bootstrap.succeeded", targetType: "server", targetId: job.serverId, target: context.serverName,
           detail: "SSH bootstrap installed the Agent and received a heartbeat", actor: context.actor, correlationId: job.id,
           metadata: { host: job.host, port: job.port, username: job.username, hostKeyFingerprint: job.hostKeyFingerprint } });
