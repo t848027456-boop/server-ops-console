@@ -10,6 +10,8 @@ The supported production shape is a single control-plane container with a persis
 4. Back up `/data/ops-console.sqlite` before upgrades and before changing the container image.
 5. Keep the health endpoint available to the proxy: `GET /api/v1/health`.
 
+Operators sign in through the control-plane login page using the configured `OPS_ADMIN_TOKEN` as the management password. The password is verified before it is stored for the current browser session. `GET /api/v1/auth/session` provides the side-effect-free authentication check used by the UI.
+
 The control plane requires authentication by default, even when a proxy connects to it over loopback. The only bypass is the explicit `OPS_ALLOW_INSECURE_LOCAL=1` development opt-in; never set it in a shared deployment.
 
 ## Agent enrollment

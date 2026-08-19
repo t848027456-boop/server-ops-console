@@ -88,6 +88,21 @@ class FakeSshClient extends EventEmitter {
 }
 
 assert.throws(() => createOpsServer({ dbPath: join(temporaryDirectory, "unauthenticated.sqlite") }), /OPS_ADMIN_TOKEN/);
+const insecureLocalApp = createOpsServer({
+  dbPath: join(temporaryDirectory, "insecure-local.sqlite"),
+  frontendDir: frontendDirectory,
+  allowInsecureLocal: true,
+  logger: { info() {}, warn() {}, error: console.error },
+});
+await new Promise((resolveListen) => insecureLocalApp.httpServer.listen(0, "127.0.0.1", resolveListen));
+const insecureLocalAddress = insecureLocalApp.httpServer.address();
+assert(insecureLocalAddress && typeof insecureLocalAddress === "object");
+const insecureLocalSessionResponse = await fetch(`http://127.0.0.1:${insecureLocalAddress.port}/api/v1/auth/session`);
+assert.equal(insecureLocalSessionResponse.status, 200);
+const insecureLocalSession = await insecureLocalSessionResponse.json();
+assert.deepEqual(insecureLocalSession.data, { actor: "local-owner", mode: "insecure-local" });
+await insecureLocalApp.close();
+
 const appOptions = {
   dbPath: join(temporaryDirectory, "ops.sqlite"),
   frontendDir: frontendDirectory,
@@ -126,6 +141,19 @@ try {
 
   const unauthorized = await fetch(`${baseUrl}/api/v1/overview`);
   assert.equal(unauthorized.status, 401);
+
+  const unauthorizedSession = await fetch(`${baseUrl}/api/v1/auth/session`);
+  assert.equal(unauthorizedSession.status, 401);
+  assert.equal((await unauthorizedSession.json()).error.code, "CONTROL_PLANE_UNAUTHORIZED");
+
+  const invalidSession = await fetch(`${baseUrl}/api/v1/auth/session`, {
+    headers: { authorization: "Bearer incorrect-admin-token" },
+  });
+  assert.equal(invalidSession.status, 401);
+  assert.equal((await invalidSession.json()).error.code, "CONTROL_PLANE_UNAUTHORIZED");
+
+  const authenticatedSession = await api("/api/v1/auth/session");
+  assert.deepEqual(authenticatedSession.data, { actor: "local-owner", mode: "token" });
 
   const initialOverview = await api("/api/v1/overview");
   assert.equal(initialOverview.data.servers.total, 0);

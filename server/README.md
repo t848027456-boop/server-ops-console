@@ -37,7 +37,7 @@ OPS_BOOTSTRAP_ALLOW_HOSTNAMES=0
 OPS_TRUST_PROXY=0
 ```
 
-`OPS_ADMIN_TOKEN` is required by default, including when a reverse proxy talks to the service over loopback. Set `OPS_ALLOW_INSECURE_LOCAL=1` only for an isolated development session. In the UI, open the owner entry at the bottom of the sidebar and enter the same token; it is kept in browser session storage and cleared when that browser session ends.
+`OPS_ADMIN_TOKEN` is required by default, including when a reverse proxy talks to the service over loopback. Set `OPS_ALLOW_INSECURE_LOCAL=1` only for an isolated development session. Enter the same value as the management password on the login page. The UI verifies it before keeping it in browser session storage, and logout clears both current and legacy browser storage.
 
 In production, terminate TLS at a reverse proxy and restrict the Agent path to authenticated clients. The current implementation authenticates each Agent with a random per-server bearer credential; certificate enrollment and mTLS rotation remain a separate deployment hardening step.
 
@@ -49,6 +49,7 @@ Responses use `{ "data": ... }`; errors use `{ "error": { "code", "message" } }`
 
 ```text
 GET  /api/v1/health
+GET  /api/v1/auth/session
 GET  /api/v1/overview
 
 GET  /api/v1/servers

@@ -1,6 +1,10 @@
 import type { AlertItem, AuditItem, BootstrapJob, BootstrapPreflight, BootstrapPreflightCheck, Overview, Project, Server, Task } from "./data";
 
 const API_BASE = "/api/v1";
+const ADMIN_TOKEN_STORAGE_KEY = "ops-admin-token";
+export const AUTH_REQUIRED_EVENT = "ops-auth-required";
+let inMemoryAdminToken = "";
+let adminTokenRevision = 0;
 
 interface ApiEnvelope<T, M = Record<string, unknown>> {
   data: T;
@@ -14,19 +18,46 @@ interface AuditPageMeta {
   hasMore: boolean;
 }
 
-class ApiError extends Error {
+export class ApiError extends Error {
   constructor(message: string, readonly status: number, readonly code?: string) {
     super(message);
     this.name = "ApiError";
   }
 }
 
-function adminToken() {
-  return window.sessionStorage.getItem("ops-admin-token") || window.localStorage.getItem("ops-admin-token") || "";
+export function getStoredAdminToken() {
+  try {
+    const stored = window.sessionStorage.getItem(ADMIN_TOKEN_STORAGE_KEY)
+      || window.localStorage.getItem(ADMIN_TOKEN_STORAGE_KEY)
+      || "";
+    if (stored) inMemoryAdminToken = stored;
+    return stored || inMemoryAdminToken;
+  } catch {
+    return inMemoryAdminToken;
+  }
 }
 
-async function requestEnvelope<T, M = Record<string, unknown>>(path: string, options: RequestInit = {}): Promise<ApiEnvelope<T, M>> {
-  const token = adminToken();
+export function storeAdminToken(token: string) {
+  inMemoryAdminToken = token;
+  adminTokenRevision += 1;
+  try { window.sessionStorage.setItem(ADMIN_TOKEN_STORAGE_KEY, token); } catch { /* private browsing can reject storage */ }
+  try { window.localStorage.removeItem(ADMIN_TOKEN_STORAGE_KEY); } catch { /* legacy storage may be unavailable */ }
+}
+
+export function clearAdminToken() {
+  inMemoryAdminToken = "";
+  adminTokenRevision += 1;
+  try { window.sessionStorage.removeItem(ADMIN_TOKEN_STORAGE_KEY); } catch { /* storage may be unavailable */ }
+  try { window.localStorage.removeItem(ADMIN_TOKEN_STORAGE_KEY); } catch { /* storage may be unavailable */ }
+}
+
+export function isUnauthorized(reason: unknown): reason is ApiError {
+  return reason instanceof ApiError && reason.status === 401;
+}
+
+async function requestEnvelope<T, M = Record<string, unknown>>(path: string, options: RequestInit = {}, authToken?: string): Promise<ApiEnvelope<T, M>> {
+  const token = authToken === undefined ? getStoredAdminToken() : authToken;
+  const tokenRevision = adminTokenRevision;
   const headers = new Headers(options.headers);
   headers.set("Accept", "application/json");
   if (options.body) headers.set("Content-Type", "application/json");
@@ -36,13 +67,18 @@ async function requestEnvelope<T, M = Record<string, unknown>>(path: string, opt
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) {
     const message = payload?.error?.message || `Request failed with HTTP ${response.status}`;
-    throw new ApiError(message, response.status, payload?.error?.code);
+    const error = new ApiError(message, response.status, payload?.error?.code);
+    if (response.status === 401 && error.code === "CONTROL_PLANE_UNAUTHORIZED" && authToken === undefined
+      && tokenRevision === adminTokenRevision && token === getStoredAdminToken()) {
+      window.dispatchEvent(new Event(AUTH_REQUIRED_EVENT));
+    }
+    throw error;
   }
   return payload as ApiEnvelope<T, M>;
 }
 
-async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
-  return (await requestEnvelope<T>(path, options)).data;
+async function request<T>(path: string, options: RequestInit = {}, authToken?: string): Promise<T> {
+  return (await requestEnvelope<T>(path, options, authToken)).data;
 }
 
 function idempotencyHeaders() {
@@ -187,6 +223,7 @@ function normalizeBootstrapJob(value: BootstrapJob): BootstrapJob {
 }
 
 export const api = {
+  verifyAccess: (token: string) => request<{ actor: string; mode: "token" | "insecure-local" }>("/auth/session", {}, token),
   overview: () => request<Overview>("/overview"),
   servers: () => request<Server[]>("/servers"),
   server: (id: string) => request<Server & { projectItems: Project[] }>(`/servers/${encodeURIComponent(id)}`),

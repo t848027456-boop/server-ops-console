@@ -14,6 +14,8 @@ import {
   Clipboard,
   CloudCog,
   Code2,
+  Eye,
+  EyeOff,
   FileClock,
   Fingerprint,
   Globe2,
@@ -21,6 +23,7 @@ import {
   LayoutDashboard,
   ListChecks,
   LoaderCircle,
+  LogOut,
   KeyRound,
   LockKeyhole,
   Menu,
@@ -38,7 +41,7 @@ import {
   UserRound,
   X,
 } from "lucide-react";
-import { api, ensureBootstrapFlow, rememberBootstrapJob, waitForTask } from "./api";
+import { AUTH_REQUIRED_EVENT, api, clearAdminToken, ensureBootstrapFlow, getStoredAdminToken, isUnauthorized, rememberBootstrapJob, storeAdminToken, waitForTask } from "./api";
 import type { AlertItem, AuditItem, BootstrapJob, BootstrapPreflight, Health, Overview, Project, Server, Task } from "./data";
 
 type Page = "dashboard" | "servers" | "projects" | "releases" | "alerts" | "audit";
@@ -721,24 +724,38 @@ function ProjectModal({ servers, onClose, onCreated }: { servers: Server[]; onCl
   return <div className="modal-shell"><section className="release-modal" role="dialog" aria-modal="true" aria-label="登记项目"><div className="modal-head"><div><span className="eyebrow"><Box size={14} /> 项目资产</span><h2>登记项目</h2></div><IconButton label="关闭" onClick={onClose}><X size={19} /></IconButton></div>{agentSnippet ? <div className="credential-result"><span className="success-badge"><CheckCircle2 size={24} /></span><h3>项目已登记</h3><p>将此对象加入对应 Agent 配置的 projects 数组，然后重启 Agent。</p><div className="credential-box"><pre>{agentSnippet}</pre><button type="button" title="复制 Agent 项目配置" onClick={() => void navigator.clipboard.writeText(agentSnippet)}><Clipboard size={16} /></button></div></div> : <form className="modal-form" onSubmit={submit}><div className="form-grid"><label><span>项目 ID</span><input required pattern="[a-zA-Z0-9][a-zA-Z0-9._-]{1,63}" value={form.id} onChange={(event) => setForm({ ...form, id: event.target.value })} placeholder="faceon" /></label><label><span>显示名称</span><input required value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} placeholder="FaceOn" /></label></div><label><span>服务器</span><select required value={form.serverId} onChange={(event) => setForm({ ...form, serverId: event.target.value })}><option value="">选择服务器</option>{servers.map((server) => <option key={server.id} value={server.id}>{server.name}</option>)}</select></label><div className="form-grid"><label><span>运行类型</span><select value={form.type} onChange={(event) => setForm({ ...form, type: event.target.value })}><option value="Compose">Docker Compose</option><option value="systemd">systemd</option><option value="http">HTTP 探测</option></select></label><label><span>分支</span><input value={form.branch} onChange={(event) => setForm({ ...form, branch: event.target.value })} placeholder="main" /></label></div><label><span>域名</span><input value={form.domain} onChange={(event) => setForm({ ...form, domain: event.target.value })} placeholder="app.example.com" /></label>{form.type === "Compose" ? <><label><span>工作目录</span><input required value={form.workingDirectory} onChange={(event) => setForm({ ...form, workingDirectory: event.target.value })} placeholder="/opt/app" /></label><div className="form-grid"><label><span>Compose 项目名</span><input value={form.composeProject} onChange={(event) => setForm({ ...form, composeProject: event.target.value })} placeholder={form.id || "compose project"} /></label><label><span>Compose 文件</span><input value={form.composeFile} onChange={(event) => setForm({ ...form, composeFile: event.target.value })} placeholder="compose.yaml" /></label></div></> : null}{form.type === "systemd" ? <label><span>service unit</span><input required value={form.unit} onChange={(event) => setForm({ ...form, unit: event.target.value })} placeholder="faceon.service" /></label> : null}{form.type !== "http" ? <label><span>回滚目标</span><input required value={form.rollbackRef} onChange={(event) => setForm({ ...form, rollbackRef: event.target.value })} placeholder={form.type === "Compose" ? "sha256:stable-image-digest" : "systemd:previous-stable"} /></label> : null}<label><span>健康检查 URL</span><input required={form.type === "http"} type="url" value={form.healthUrl} onChange={(event) => setForm({ ...form, healthUrl: event.target.value })} placeholder="https://app.example.com/api/health" /></label>{error ? <div className="inline-error"><AlertCircle size={16} />{error}</div> : null}</form>}<div className="modal-actions"><button className="button button--secondary" type="button" onClick={onClose}>{agentSnippet ? "完成" : "取消"}</button>{!agentSnippet ? <button className="button button--primary" type="button" disabled={busy || !form.serverId || !form.id || !form.name} onClick={() => (document.querySelector(".modal-form") as HTMLFormElement)?.requestSubmit()}>{busy ? <LoaderCircle className="spin" size={16} /> : <Plus size={16} />}登记项目</button> : null}</div></section></div>;
 }
 
-function AccessModal({ onClose, onSaved }: { onClose: () => void; onSaved: () => Promise<void> }) {
-  const [token, setToken] = useState(() => window.sessionStorage.getItem("ops-admin-token") || window.localStorage.getItem("ops-admin-token") || "");
-  const [busy, setBusy] = useState(false);
-  const save = async (event: FormEvent) => {
-    event.preventDefault();
-    setBusy(true);
-    const normalized = token.trim();
-    if (normalized) window.sessionStorage.setItem("ops-admin-token", normalized);
-    else window.sessionStorage.removeItem("ops-admin-token");
-    window.localStorage.removeItem("ops-admin-token");
-    await onSaved();
-    setBusy(false);
-    onClose();
-  };
-  return <div className="modal-shell" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><section className="release-modal access-modal" role="dialog" aria-modal="true" aria-label="控制端访问设置"><div className="modal-head"><div><span className="eyebrow"><LockKeyhole size={14} /> 控制端认证</span><h2>访问设置</h2></div><IconButton label="关闭" onClick={onClose}><X size={19} /></IconButton></div><form className="modal-form" onSubmit={save}><label><span>管理令牌</span><input type="password" autoComplete="off" value={token} onChange={(event) => setToken(event.target.value)} placeholder="OPS_ADMIN_TOKEN" /></label><div className="modal-actions modal-actions--flush"><button className="button button--secondary" type="button" onClick={onClose}>取消</button><button className="button button--primary" type="submit" disabled={busy}>{busy ? <LoaderCircle className="spin" size={16} /> : <ShieldCheck size={16} />}应用并重试</button></div></form></section></div>;
+function AuthBrand() {
+  return <div className="auth-brand"><span className="brand-mark"><Activity size={20} /></span><div><strong>眺望</strong><span>项目运维台</span></div></div>;
 }
 
-export default function App() {
+function LoginPage({ initialToken, initialError, onLogin }: { initialToken: string; initialError: string | null; onLogin: (token: string) => Promise<void> }) {
+  const [token, setToken] = useState(initialToken);
+  const [visible, setVisible] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(initialError);
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    const normalized = token.trim();
+    if (!normalized) { setError("请输入管理密码"); return; }
+    if (/^OPS_ADMIN_TOKEN\s*=/.test(normalized)) { setError("只需输入等号后面的管理密码"); return; }
+    setBusy(true);
+    setError(null);
+    try {
+      await onLogin(normalized);
+    } catch (reason) {
+      setError(isUnauthorized(reason) ? "管理密码不正确，请重新输入" : "暂时无法连接控制端，请稍后重试");
+    } finally {
+      setBusy(false);
+    }
+  };
+  return <main className="auth-shell"><div className="auth-frame"><AuthBrand /><section className="auth-panel" aria-labelledby="login-title"><div className="auth-panel__head"><span className="auth-panel__icon"><LockKeyhole size={19} /></span><div><h1 id="login-title">登录控制端</h1><p>使用部署时设置的管理密码</p></div></div><form className="auth-form" onSubmit={submit}><label htmlFor="admin-password">管理密码</label><div className="password-field"><input id="admin-password" type={visible ? "text" : "password"} autoComplete="current-password" autoFocus required value={token} aria-invalid={Boolean(error)} aria-describedby={error ? "login-error" : undefined} onChange={(event) => { setToken(event.target.value); if (error) setError(null); }} placeholder="输入管理密码" /><button type="button" aria-label={visible ? "隐藏管理密码" : "显示管理密码"} title={visible ? "隐藏管理密码" : "显示管理密码"} onClick={() => setVisible((current) => !current)}>{visible ? <EyeOff size={18} /> : <Eye size={18} />}</button></div>{error ? <div className="auth-error" id="login-error" role="alert" aria-live="polite"><AlertCircle size={16} /><span>{error}</span></div> : null}<button className="button button--primary auth-submit" type="submit" disabled={busy} aria-busy={busy}>{busy ? <LoaderCircle className="spin" size={17} /> : <ArrowRight size={17} />}{busy ? "正在验证" : "登录"}</button></form></section><div className="auth-assurance"><ShieldCheck size={15} /><span>凭据仅保存在本次浏览器会话</span></div></div></main>;
+}
+
+function AuthChecking() {
+  return <main className="auth-shell"><div className="auth-frame auth-frame--checking"><AuthBrand /><div className="auth-checking" role="status"><LoaderCircle className="spin" size={20} /><span>正在验证访问权限</span></div></div></main>;
+}
+
+function AuthenticatedConsole({ onLogout }: { onLogout: () => void }) {
   const [page, setPage] = useState<Page>("dashboard");
   const [overview, setOverview] = useState<Overview>(emptyOverview);
   const [servers, setServers] = useState<Server[]>([]);
@@ -754,7 +771,6 @@ export default function App() {
   const [showBootstrapHistory, setShowBootstrapHistory] = useState(false);
   const [bootstrapHistoryJobId, setBootstrapHistoryJobId] = useState<string | null>(null);
   const [showProjectForm, setShowProjectForm] = useState(false);
-  const [showAccess, setShowAccess] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -824,8 +840,69 @@ export default function App() {
   ];
   const title = pageTitles[page];
 
-  return <div className="app-shell"><aside className={`sidebar${sidebarOpen ? " sidebar--open" : ""}`}><div className="brand"><span className="brand-mark"><Activity size={19} /></span><div><strong>眺望</strong><span>项目运维台</span></div><IconButton label="收起导航" onClick={() => setSidebarOpen(false)}><PanelLeftClose size={18} /></IconButton></div><nav className="main-nav" aria-label="主导航"><span className="nav-label">工作台</span>{navItems.slice(0, 4).map((item) => { const ItemIcon = item.icon; return <button className={page === item.id ? "is-active" : ""} type="button" key={item.id} onClick={() => navigate(item.id)}><ItemIcon size={18} /><span>{item.label}</span>{item.badge ? <b>{item.badge}</b> : null}</button>; })}<span className="nav-label nav-label--spaced">管理</span>{navItems.slice(4).map((item) => { const ItemIcon = item.icon; return <button className={page === item.id ? "is-active" : ""} type="button" key={item.id} onClick={() => navigate(item.id)}><ItemIcon size={18} /><span>{item.label}</span>{item.badge ? <b>{item.badge}</b> : null}</button>; })}</nav><div className="sidebar-status"><div><span className="pulse-dot" /><strong>{loadError ? "控制端异常" : "控制端正常"}</strong></div><span>Agent {overview.connectedAgents} / {overview.servers.total} 在线</span></div><button className="account" type="button" onClick={() => { setShowAccess(true); setSidebarOpen(false); }}><span className="avatar"><UserRound size={17} /></span><span><strong>local-owner</strong><small>访问设置</small></span><LockKeyhole size={16} /></button></aside>{sidebarOpen ? <button className="sidebar-backdrop" type="button" aria-label="关闭导航" onClick={() => setSidebarOpen(false)} /> : null}
-    <main className="main-area"><header className="topbar"><IconButton label="打开导航" onClick={() => setSidebarOpen(true)}><Menu size={20} /></IconButton><div className="page-title"><h1>{title.title}</h1><span>{title.subtitle}</span></div><div className="topbar-actions"><span className="sync-label">同步于 {overview.generatedAt ? relativeTime(overview.generatedAt) : "等待控制端"}</span><IconButton label="刷新状态" onClick={() => void refresh()}><RefreshCw className={refreshing ? "spin" : ""} size={18} /></IconButton><button className="button button--secondary scan-button" type="button" onClick={() => void refresh()} disabled={refreshing}>{refreshing ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}{refreshing ? "正在刷新" : "刷新数据"}</button><IconButton label="通知" active={unresolvedAlerts > 0} onClick={() => navigate("alerts")}><Bell size={18} />{unresolvedAlerts ? <span className="notification-dot" /> : null}</IconButton></div></header><div className="content">{loadError ? <div className="connection-error"><AlertCircle size={18} /><div><strong>控制端数据未完整读取</strong><span>{loadError}</span></div><button className="button button--secondary button--small" type="button" onClick={() => setShowAccess(true)}>访问设置</button><button className="button button--secondary button--small" type="button" onClick={() => void loadAll()}>重试</button></div> : null}{loading ? <div className="page-loading"><LoaderCircle className="spin" size={22} /><span>正在读取真实状态</span></div> : <>{page === "dashboard" ? <Dashboard overview={overview} servers={servers} projects={projects} alerts={alerts} tasks={tasks} onPage={navigate} onServer={setSelectedServer} /> : null}{page === "servers" ? <ServersView servers={servers} bootstrapJobs={bootstrapJobs} onSelect={setSelectedServer} onEnroll={() => setShowEnrollment(true)} onHistory={() => openBootstrapHistory()} /> : null}{page === "projects" ? <ProjectsView projects={projects} servers={servers} onSelect={setSelectedProject} onPreflight={setPreflightProject} onRegister={() => setShowProjectForm(true)} /> : null}{page === "releases" ? <TaskCenter tasks={tasks} projects={projects} servers={servers} onPreflight={setPreflightProject} onChanged={async () => { await loadAll(true); }} /> : null}{page === "alerts" ? <AlertsView alerts={alerts} acknowledge={acknowledge} onBootstrapJob={openBootstrapHistory} /> : null}{page === "audit" ? <AuditView items={audit} /> : null}</>}</div></main>
-    {selectedServer ? <ServerDrawer server={selectedServer} projects={projects} onClose={() => setSelectedServer(null)} onProject={openProject} onRefresh={refreshServer} /> : null}{selectedProject ? <ProjectDrawer project={selectedProject} serverConnected={projectServerConnected(selectedProject)} onClose={() => setSelectedProject(null)} onPreflight={() => { setPreflightProject(selectedProject); setSelectedProject(null); }} onRestart={() => restartProject(selectedProject)} /> : null}{preflightProject ? <PreflightModal project={preflightProject} serverConnected={projectServerConnected(preflightProject)} onClose={() => setPreflightProject(null)} onChanged={async () => { await loadAll(true); }} /> : null}{showEnrollment ? <EnrollmentModal onClose={() => setShowEnrollment(false)} onCreated={async () => { await loadAll(true); }} /> : null}{showBootstrapHistory ? <BootstrapHistoryModal jobs={bootstrapJobs} initialJobId={bootstrapHistoryJobId} onClose={() => setShowBootstrapHistory(false)} onRefresh={async () => { await loadAll(true); }} onResolve={resolveBootstrapRecovery} /> : null}{showProjectForm ? <ProjectModal servers={servers} onClose={() => setShowProjectForm(false)} onCreated={async () => { await loadAll(true); }} /> : null}{showAccess ? <AccessModal onClose={() => setShowAccess(false)} onSaved={async () => { await loadAll(); }} /> : null}{toast ? <div className={`toast toast--${toast.tone}`}>{toast.tone === "success" ? <CheckCircle2 size={17} /> : <AlertCircle size={17} />}{toast.message}</div> : null}
+  return <div className="app-shell"><aside className={`sidebar${sidebarOpen ? " sidebar--open" : ""}`}><div className="brand"><span className="brand-mark"><Activity size={19} /></span><div><strong>眺望</strong><span>项目运维台</span></div><IconButton label="收起导航" onClick={() => setSidebarOpen(false)}><PanelLeftClose size={18} /></IconButton></div><nav className="main-nav" aria-label="主导航"><span className="nav-label">工作台</span>{navItems.slice(0, 4).map((item) => { const ItemIcon = item.icon; return <button className={page === item.id ? "is-active" : ""} type="button" key={item.id} onClick={() => navigate(item.id)}><ItemIcon size={18} /><span>{item.label}</span>{item.badge ? <b>{item.badge}</b> : null}</button>; })}<span className="nav-label nav-label--spaced">管理</span>{navItems.slice(4).map((item) => { const ItemIcon = item.icon; return <button className={page === item.id ? "is-active" : ""} type="button" key={item.id} onClick={() => navigate(item.id)}><ItemIcon size={18} /><span>{item.label}</span>{item.badge ? <b>{item.badge}</b> : null}</button>; })}</nav><div className="sidebar-status"><div><span className="pulse-dot" /><strong>{loadError ? "控制端异常" : "控制端正常"}</strong></div><span>Agent {overview.connectedAgents} / {overview.servers.total} 在线</span></div><div className="account account--static"><span className="avatar"><UserRound size={17} /></span><span><strong>local-owner</strong><small>管理员</small></span><IconButton label="退出登录" onClick={onLogout}><LogOut size={16} /></IconButton></div></aside>{sidebarOpen ? <button className="sidebar-backdrop" type="button" aria-label="关闭导航" onClick={() => setSidebarOpen(false)} /> : null}
+    <main className="main-area"><header className="topbar"><IconButton label="打开导航" onClick={() => setSidebarOpen(true)}><Menu size={20} /></IconButton><div className="page-title"><h1>{title.title}</h1><span>{title.subtitle}</span></div><div className="topbar-actions"><span className="sync-label">同步于 {overview.generatedAt ? relativeTime(overview.generatedAt) : "等待控制端"}</span><IconButton label="刷新状态" onClick={() => void refresh()}><RefreshCw className={refreshing ? "spin" : ""} size={18} /></IconButton><button className="button button--secondary scan-button" type="button" onClick={() => void refresh()} disabled={refreshing}>{refreshing ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}{refreshing ? "正在刷新" : "刷新数据"}</button><IconButton label="通知" active={unresolvedAlerts > 0} onClick={() => navigate("alerts")}><Bell size={18} />{unresolvedAlerts ? <span className="notification-dot" /> : null}</IconButton></div></header><div className="content">{loadError ? <div className="connection-error"><AlertCircle size={18} /><div><strong>控制端数据未完整读取</strong><span>{loadError}</span></div><button className="button button--secondary button--small" type="button" onClick={() => void loadAll()}>重试</button></div> : null}{loading ? <div className="page-loading"><LoaderCircle className="spin" size={22} /><span>正在读取真实状态</span></div> : <>{page === "dashboard" ? <Dashboard overview={overview} servers={servers} projects={projects} alerts={alerts} tasks={tasks} onPage={navigate} onServer={setSelectedServer} /> : null}{page === "servers" ? <ServersView servers={servers} bootstrapJobs={bootstrapJobs} onSelect={setSelectedServer} onEnroll={() => setShowEnrollment(true)} onHistory={() => openBootstrapHistory()} /> : null}{page === "projects" ? <ProjectsView projects={projects} servers={servers} onSelect={setSelectedProject} onPreflight={setPreflightProject} onRegister={() => setShowProjectForm(true)} /> : null}{page === "releases" ? <TaskCenter tasks={tasks} projects={projects} servers={servers} onPreflight={setPreflightProject} onChanged={async () => { await loadAll(true); }} /> : null}{page === "alerts" ? <AlertsView alerts={alerts} acknowledge={acknowledge} onBootstrapJob={openBootstrapHistory} /> : null}{page === "audit" ? <AuditView items={audit} /> : null}</>}</div></main>
+    {selectedServer ? <ServerDrawer server={selectedServer} projects={projects} onClose={() => setSelectedServer(null)} onProject={openProject} onRefresh={refreshServer} /> : null}{selectedProject ? <ProjectDrawer project={selectedProject} serverConnected={projectServerConnected(selectedProject)} onClose={() => setSelectedProject(null)} onPreflight={() => { setPreflightProject(selectedProject); setSelectedProject(null); }} onRestart={() => restartProject(selectedProject)} /> : null}{preflightProject ? <PreflightModal project={preflightProject} serverConnected={projectServerConnected(preflightProject)} onClose={() => setPreflightProject(null)} onChanged={async () => { await loadAll(true); }} /> : null}{showEnrollment ? <EnrollmentModal onClose={() => setShowEnrollment(false)} onCreated={async () => { await loadAll(true); }} /> : null}{showBootstrapHistory ? <BootstrapHistoryModal jobs={bootstrapJobs} initialJobId={bootstrapHistoryJobId} onClose={() => setShowBootstrapHistory(false)} onRefresh={async () => { await loadAll(true); }} onResolve={resolveBootstrapRecovery} /> : null}{showProjectForm ? <ProjectModal servers={servers} onClose={() => setShowProjectForm(false)} onCreated={async () => { await loadAll(true); }} /> : null}{toast ? <div className={`toast toast--${toast.tone}`}>{toast.tone === "success" ? <CheckCircle2 size={17} /> : <AlertCircle size={17} />}{toast.message}</div> : null}
   </div>;
+}
+
+type AuthState = "checking" | "anonymous" | "authenticated";
+
+export default function App() {
+  const [authState, setAuthState] = useState<AuthState>("checking");
+  const [authError, setAuthError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let disposed = false;
+    const token = getStoredAdminToken();
+    const verify = async () => {
+      try {
+        const session = await api.verifyAccess(token);
+        if (!disposed) {
+          if (session.mode === "token" && token) storeAdminToken(token);
+          else clearAdminToken();
+          setAuthError(null);
+          setAuthState("authenticated");
+        }
+      } catch (reason) {
+        if (disposed) return;
+        if (isUnauthorized(reason)) {
+          clearAdminToken();
+          setAuthError(token ? "登录信息已失效，请重新输入管理密码" : null);
+        } else {
+          setAuthError("暂时无法连接控制端，请稍后重试");
+        }
+        setAuthState("anonymous");
+      }
+    };
+    void verify();
+    return () => { disposed = true; };
+  }, []);
+
+  useEffect(() => {
+    const requireAuthentication = () => {
+      clearAdminToken();
+      setAuthError("登录已失效，请重新输入管理密码");
+      setAuthState("anonymous");
+    };
+    window.addEventListener(AUTH_REQUIRED_EVENT, requireAuthentication);
+    return () => window.removeEventListener(AUTH_REQUIRED_EVENT, requireAuthentication);
+  }, []);
+
+  const login = async (token: string) => {
+    await api.verifyAccess(token);
+    storeAdminToken(token);
+    setAuthError(null);
+    setAuthState("authenticated");
+  };
+
+  const logout = () => {
+    clearAdminToken();
+    setAuthError(null);
+    setAuthState("anonymous");
+  };
+
+  if (authState === "checking") return <AuthChecking />;
+  if (authState === "anonymous") return <LoginPage initialToken={getStoredAdminToken()} initialError={authError} onLogin={login} />;
+  return <AuthenticatedConsole onLogout={logout} />;
 }

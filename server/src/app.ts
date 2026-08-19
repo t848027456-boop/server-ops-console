@@ -272,7 +272,9 @@ export function createOpsServer(options: OpsServerOptions) {
   const verifyApiAuth = (request: IncomingMessage, pathname: string) => {
     if (!options.adminToken || pathname === "/api/v1/health") return;
     const token = parseBearer(request.headers.authorization);
-    if (!token || !tokenMatches(token, hashToken(options.adminToken))) throw new HttpError(401, "Invalid control-plane token");
+    if (!token || !tokenMatches(token, hashToken(options.adminToken))) {
+      throw new HttpError(401, "Invalid control-plane token", undefined, "CONTROL_PLANE_UNAUTHORIZED");
+    }
   };
 
   const requireSecureBootstrap = (request: IncomingMessage) => {
@@ -633,6 +635,14 @@ export function createOpsServer(options: OpsServerOptions) {
 
     if (method === "GET" && path === "/api/v1/health") {
       sendJson(response, 200, { status: "ok", time: new Date().toISOString(), connectedAgents: sessions.size });
+      return;
+    }
+
+    if (method === "GET" && path === "/api/v1/auth/session") {
+      sendJson(response, 200, { data: {
+        actor: actorFrom(request),
+        mode: options.adminToken ? "token" : "insecure-local",
+      } });
       return;
     }
 
