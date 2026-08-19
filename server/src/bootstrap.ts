@@ -1382,7 +1382,10 @@ export class BootstrapManager {
     const tempConfig = shellSafePath(`/tmp/server-ops-agent-${safeJob}.json`);
     const tempEnv = shellSafePath(`/tmp/server-ops-agent-${safeJob}.env`);
     const tempService = shellSafePath(`/tmp/server-ops-agent-${safeJob}.service`);
-    const tempRuntime = shellSafePath(`/tmp/server-ops-agent-${safeJob}.node`);
+    // Hardened hosts often mount /tmp with noexec. /opt is the supported Agent
+    // installation filesystem, so stage the executable there before its atomic
+    // move into the managed runtime path.
+    const tempRuntime = shellSafePath(`/opt/.server-ops-agent-${safeJob}.node`);
     const backupDir = shellSafePath(`${AGENT_STATE_DIR}/.bootstrap-${safeJob}`);
     job.backupDir = backupDir;
     const config = Buffer.from(JSON.stringify({

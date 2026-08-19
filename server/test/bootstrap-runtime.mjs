@@ -45,7 +45,7 @@ function commandResult(state, command) {
   const isRuntimeVerification = command.includes("sha256sum -c -");
   if (isRuntimeVerification) {
     const checksum = command.match(/\b[a-f0-9]{64}\b/)?.[0];
-    const runtimePath = command.match(/\/tmp\/server-ops-agent-[a-zA-Z0-9]+\.node/)?.[0];
+    const runtimePath = command.match(/\/opt\/\.server-ops-agent-[a-zA-Z0-9]+\.node/)?.[0];
     const uploadedRuntime = runtimePath ? state.uploads.get(runtimePath)?.content : undefined;
     const actualChecksum = uploadedRuntime ? createHash("sha256").update(uploadedRuntime).digest("hex") : null;
     state.runtimeVerifications.push({ checksum, actualChecksum, runtimePath, isInstall });
@@ -244,11 +244,11 @@ try {
     }
     assert.equal(state.installCommands.length, 1);
     assert.match(state.installCommands[0], /if \[ -e \/opt\/server-ops-agent\/node \]; then cp -a \/opt\/server-ops-agent\/node \/var\/lib\/server-ops-agent\/\.bootstrap-[a-zA-Z0-9]+\/runtime; else touch \/var\/lib\/server-ops-agent\/\.bootstrap-[a-zA-Z0-9]+\/runtime\.missing; fi/);
-    assert.match(state.installCommands[0], /install -m 0755 \/tmp\/server-ops-agent-[a-zA-Z0-9]+\.node \/opt\/server-ops-agent\/node\.tmp/);
+    assert.match(state.installCommands[0], /install -m 0755 \/opt\/\.server-ops-agent-[a-zA-Z0-9]+\.node \/opt\/server-ops-agent\/node\.tmp/);
     assert.match(state.installCommands[0], /mv -f \/opt\/server-ops-agent\/node\.tmp \/opt\/server-ops-agent\/node/);
     assert.equal(state.startCommands.length, 1);
     assert.equal(state.cleanupCommands.length, 1);
-    assert.match(state.cleanupCommands[0], /\/tmp\/server-ops-agent-[a-zA-Z0-9]+\.node/);
+    assert.match(state.cleanupCommands[0], /\/opt\/\.server-ops-agent-[a-zA-Z0-9]+\.node/);
     assert.equal(db.getServer(state.serverId)?.agent_version, "managed-runtime-test");
     await closeScenario(scenario);
   }
@@ -288,7 +288,7 @@ try {
   assert.equal(managedRuntimeUpload(uploadFailure.state), undefined);
   assert.equal(uploadFailure.state.runtimeVerifications.length, 0);
   assert.equal(uploadFailure.state.rollbackCommands.length, 1);
-  assert.match(uploadFailure.state.rollbackCommands[0], /\/tmp\/server-ops-agent-[a-zA-Z0-9]+\.node/);
+  assert.match(uploadFailure.state.rollbackCommands[0], /\/opt\/\.server-ops-agent-[a-zA-Z0-9]+\.node/);
   assert.match(uploadFailure.state.rollbackCommands[0], /\/opt\/server-ops-agent\/node\.tmp/);
   await closeScenario(uploadFailure);
 
@@ -299,7 +299,7 @@ try {
   assert.equal(verificationFailure.state.runtimeVerifications.length, 1);
   assert.equal(verificationFailure.state.installCommands.length, 0);
   assert.equal(verificationFailure.state.rollbackCommands.length, 1);
-  assert.match(verificationFailure.state.rollbackCommands[0], /\/tmp\/server-ops-agent-[a-zA-Z0-9]+\.node/);
+  assert.match(verificationFailure.state.rollbackCommands[0], /\/opt\/\.server-ops-agent-[a-zA-Z0-9]+\.node/);
   assert.equal(verificationFailure.db.getServer(verificationFailure.state.serverId), undefined);
   await closeScenario(verificationFailure);
 

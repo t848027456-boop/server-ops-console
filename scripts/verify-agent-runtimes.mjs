@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import { readFileSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 
@@ -24,4 +25,15 @@ for (const runtime of runtimes) {
 
   const sha256 = createHash("sha256").update(data).digest("hex");
   console.log(`${runtime.architecture} ${sha256} ${data.length}`);
+}
+
+const nativeArchitecture = process.arch === "x64" ? "x64" : process.arch === "arm64" ? "arm64" : null;
+if (!nativeArchitecture) throw new Error(`container build architecture ${process.arch} is unsupported`);
+const nativeRuntime = runtimes.find((runtime) => runtime.architecture === nativeArchitecture);
+if (!nativeRuntime) throw new Error(`native ${nativeArchitecture} runtime is missing`);
+const versionCheck = spawnSync(resolve(nativeRuntime.path), ["-p", "Number(process.versions.node.split('.')[0])"], {
+  encoding: "utf8",
+});
+if (versionCheck.status !== 0 || Number(versionCheck.stdout.trim()) < 22) {
+  throw new Error(`native ${nativeArchitecture} runtime is not executable Node.js 22 or newer`);
 }
