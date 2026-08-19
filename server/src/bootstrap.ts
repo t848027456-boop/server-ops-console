@@ -313,7 +313,7 @@ function safeUsername(value: unknown) {
 function safeId(value: unknown, field: string) {
   const id = safeText(value, field, 64);
   if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{1,63}$/.test(id)) {
-    throw new BootstrapError("BOOTSTRAP_INVALID", `${field} is invalid`, 400);
+    throw new BootstrapError("BOOTSTRAP_INVALID", `${field} is invalid`, 400, { field });
   }
   return id;
 }

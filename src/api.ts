@@ -1,4 +1,5 @@
 import type { AlertItem, AuditItem, BootstrapJob, BootstrapPreflight, BootstrapPreflightCheck, Overview, Project, Server, Task } from "./data";
+import { bootstrapRequestBody, type BootstrapRequestInput } from "./enrollment";
 
 const API_BASE = "/api/v1";
 const ADMIN_TOKEN_STORAGE_KEY = "ops-admin-token";
@@ -19,7 +20,7 @@ interface AuditPageMeta {
 }
 
 export class ApiError extends Error {
-  constructor(message: string, readonly status: number, readonly code?: string) {
+  constructor(message: string, readonly status: number, readonly code?: string, readonly details?: unknown) {
     super(message);
     this.name = "ApiError";
   }
@@ -67,7 +68,7 @@ async function requestEnvelope<T, M = Record<string, unknown>>(path: string, opt
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) {
     const message = payload?.error?.message || `Request failed with HTTP ${response.status}`;
-    const error = new ApiError(message, response.status, payload?.error?.code);
+    const error = new ApiError(message, response.status, payload?.error?.code, payload?.error?.details);
     if (response.status === 401 && error.code === "CONTROL_PLANE_UNAUTHORIZED" && authToken === undefined
       && tokenRevision === adminTokenRevision && token === getStoredAdminToken()) {
       window.dispatchEvent(new Event(AUTH_REQUIRED_EVENT));
@@ -279,10 +280,10 @@ export const api = {
     method: "POST",
     body: JSON.stringify({ address: input.address, sshPort: input.sshPort, sshUsername: input.sshUsername }),
   })),
-  bootstrap: async (input: { preflightId: string; id: string; name: string; region?: string; address: string; sshPort: number; sshUsername: string; password: string; hostKeyFingerprint: string; controlPlaneUrl: string; idempotencyKey: string }) => normalizeBootstrapJob(await request<BootstrapJob>("/servers/bootstrap", {
+  bootstrap: async (input: BootstrapRequestInput & { idempotencyKey: string }) => normalizeBootstrapJob(await request<BootstrapJob>("/servers/bootstrap", {
     method: "POST",
     headers: { "Idempotency-Key": input.idempotencyKey },
-    body: JSON.stringify({ preflightId: input.preflightId, id: input.id, name: input.name, region: input.region, address: input.address, sshPort: input.sshPort, sshUsername: input.sshUsername, password: input.password, hostKeyFingerprint: input.hostKeyFingerprint, controlPlaneUrl: input.controlPlaneUrl }),
+    body: JSON.stringify(bootstrapRequestBody(input)),
   })),
   bootstrapJobs: async () => {
     const jobs = await request<BootstrapJob[]>("/servers/bootstrap");

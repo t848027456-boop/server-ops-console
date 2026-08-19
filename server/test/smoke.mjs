@@ -231,6 +231,24 @@ try {
   }, 409);
   assert.equal(mismatchedBootstrap.error.code, "SSH_HOST_KEY_MISMATCH");
 
+  const invalidServerId = await api("/api/v1/servers/bootstrap", {
+    method: "POST",
+    headers: { "content-type": "application/json", "idempotency-key": "bootstrap-invalid-server-id" },
+    body: JSON.stringify({
+      preflightId: bootstrapPreflight.data.id,
+      address: "203.0.113.10",
+      sshPort: 2222,
+      sshUsername: "root",
+      hostKeyFingerprint: bootstrapPreflight.data.hostKeyFingerprint,
+      password: "bootstrap smoke password",
+      id: "US大鸡",
+      name: "US大鸡",
+      controlPlaneUrl: baseUrl,
+    }),
+  }, 400);
+  assert.equal(invalidServerId.error.code, "BOOTSTRAP_INVALID");
+  assert.equal(invalidServerId.error.details.field, "serverId");
+
   const bootstrapStarted = await api("/api/v1/servers/bootstrap", {
     method: "POST",
     headers: { "content-type": "application/json", "idempotency-key": "bootstrap-success-001" },
@@ -241,11 +259,11 @@ try {
       sshUsername: "root",
       hostKeyFingerprint: bootstrapPreflight.data.hostKeyFingerprint,
       password: "bootstrap smoke password",
-      id: "bootstrap-smoke-server",
-      name: "Bootstrap Smoke Server",
+      name: "US大鸡",
       controlPlaneUrl: baseUrl,
     }),
   }, 202);
+  assert.match(bootstrapStarted.data.serverId, /^srv-[0-9a-f-]{36}$/);
   assert.equal(bootstrapStarted.data.password, undefined);
   assert(["queued", "running"].includes(bootstrapStarted.data.status));
   const bootstrapReplay = await api("/api/v1/servers/bootstrap", {
@@ -258,12 +276,12 @@ try {
       sshUsername: "root",
       hostKeyFingerprint: bootstrapPreflight.data.hostKeyFingerprint,
       password: "bootstrap smoke password",
-      id: "bootstrap-smoke-server",
-      name: "Bootstrap Smoke Server",
+      name: "US大鸡",
       controlPlaneUrl: baseUrl,
     }),
   });
   assert.equal(bootstrapReplay.data.id, bootstrapStarted.data.id);
+  assert.equal(bootstrapReplay.data.serverId, bootstrapStarted.data.serverId);
   assert.equal(bootstrapReplay.idempotentReplay, true);
   let bootstrapJob;
   for (let attempt = 0; attempt < 500; attempt += 1) {
@@ -274,6 +292,8 @@ try {
   assert.equal(bootstrapJob.data.status, "succeeded", JSON.stringify(bootstrapJob));
   assert.equal(bootstrapJob.data.stage, "completed");
   assert.equal(bootstrapJob.data.progress, 100);
+  const generatedServer = (await api("/api/v1/servers")).data.find((server) => server.id === bootstrapStarted.data.serverId);
+  assert.equal(generatedServer.name, "US大鸡");
   const uploadedService = [...bootstrapUploads.entries()].find(([path]) => path.endsWith(".service"));
   assert(uploadedService && uploadedService[1].toString("utf8").includes("ExecStart=/usr/bin/node /opt/server-ops-agent/ops-agent.cjs"));
   const persistedBootstrapText = JSON.stringify(app.db.sqlite.prepare("SELECT * FROM audit_events").all());
@@ -765,7 +785,7 @@ try {
       sshUsername: "root",
       hostKeyFingerprint: bootstrapPreflight.data.hostKeyFingerprint,
       password: "bootstrap smoke password",
-      id: "bootstrap-smoke-server",
+      id: bootstrapStarted.data.serverId,
       controlPlaneUrl: baseUrl,
     }),
   });

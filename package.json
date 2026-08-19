@@ -25,7 +25,8 @@
     "server:check": "tsc -p server/tsconfig.json --noEmit --pretty false",
     "server:smoke": "pnpm server:build && node server/test/smoke.mjs",
     "server:persistence": "pnpm server:build && node server/test/bootstrap-persistence.mjs",
-    "test": "pnpm server:smoke && pnpm server:persistence && pnpm agent:check"
+    "test": "pnpm server:smoke && pnpm server:persistence && pnpm frontend:serialization && pnpm agent:check",
+    "frontend:serialization": "tsc src/enrollment.ts --outDir .test-dist --module nodenext --moduleResolution nodenext --target es2022 --skipLibCheck && node test/enrollment-serialization.mjs"
   },
   "dependencies": {
     "lucide-react": "^0.468.0",

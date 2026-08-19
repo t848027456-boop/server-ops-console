@@ -41,7 +41,7 @@ import {
   UserRound,
   X,
 } from "lucide-react";
-import { AUTH_REQUIRED_EVENT, api, clearAdminToken, ensureBootstrapFlow, getStoredAdminToken, isUnauthorized, rememberBootstrapJob, storeAdminToken, waitForTask } from "./api";
+import { AUTH_REQUIRED_EVENT, ApiError, api, clearAdminToken, ensureBootstrapFlow, getStoredAdminToken, isUnauthorized, rememberBootstrapJob, storeAdminToken, waitForTask } from "./api";
 import type { AlertItem, AuditItem, BootstrapJob, BootstrapPreflight, Health, Overview, Project, Server, Task } from "./data";
 
 type Page = "dashboard" | "servers" | "projects" | "releases" | "alerts" | "audit";
@@ -343,7 +343,6 @@ function PreflightModal({ project, serverConnected, onClose, onChanged }: { proj
 type EnrollmentMode = "token" | "ssh";
 
 interface SshEnrollmentForm {
-  id: string;
   name: string;
   region: string;
   address: string;
@@ -429,7 +428,14 @@ function bootstrapVisualStage(job: BootstrapJob) {
 }
 
 function bootstrapError(reason: unknown, fallback: string, secret = "") {
+  if (reason instanceof ApiError && reason.code === "BOOTSTRAP_INVALID") {
+    const details = reason.details && typeof reason.details === "object" ? reason.details as Record<string, unknown> : null;
+    if (details?.field === "serverId") return "服务器内部标识无效，请刷新页面后重新接入";
+  }
   let message = reason instanceof Error ? reason.message : fallback;
+  if (/^(?:serverId is invalid|serverId must be 2-64 URL-safe characters)$/i.test(message)) {
+    message = "服务器内部标识无效，请刷新页面后重新接入";
+  }
   if (secret) message = message.split(secret).join("[已隐藏]");
   return message.replace(/((?:password|passwd|secret)\s*[=:]\s*)[^\s,;]+/gi, "$1[已隐藏]");
 }
@@ -438,7 +444,7 @@ function EnrollmentModal({ onClose, onCreated }: { onClose: () => Promise<void> 
   const [mode, setMode] = useState<EnrollmentMode>("token");
   const [form, setForm] = useState({ id: "", name: "", region: "", address: "" });
   const [credential, setCredential] = useState<{ agentToken: string; websocketPath: string } | null>(null);
-  const [sshForm, setSshForm] = useState<SshEnrollmentForm>({ id: "", name: "", region: "", address: "", sshPort: "22", sshUsername: "root", password: "", rootRiskAccepted: false });
+  const [sshForm, setSshForm] = useState<SshEnrollmentForm>({ name: "", region: "", address: "", sshPort: "22", sshUsername: "root", password: "", rootRiskAccepted: false });
   const [preflight, setPreflight] = useState<BootstrapPreflight | null>(null);
   const [fingerprintConfirmed, setFingerprintConfirmed] = useState(false);
   const [job, setJob] = useState<BootstrapJob | null>(null);
@@ -449,7 +455,7 @@ function EnrollmentModal({ onClose, onCreated }: { onClose: () => Promise<void> 
   const rootUser = sshForm.sshUsername.trim().toLowerCase() === "root";
   const port = Number(sshForm.sshPort);
   const validPort = Number.isInteger(port) && port >= 1 && port <= 65_535;
-  const sshReady = Boolean(sshForm.id.trim() && sshForm.name.trim() && sshForm.address.trim() && sshForm.sshUsername.trim() && validPort);
+  const sshReady = Boolean(sshForm.name.trim() && sshForm.address.trim() && sshForm.sshUsername.trim() && validPort);
 
   const resetSshVerification = () => {
     setPreflight(null);
@@ -496,7 +502,6 @@ function EnrollmentModal({ onClose, onCreated }: { onClose: () => Promise<void> 
       const flow = ensureBootstrapFlow(preflight.preflightId, { host: sshForm.address.trim() });
       const result = await api.bootstrap({
         preflightId: preflight.preflightId,
-        id: sshForm.id.trim(),
         name: sshForm.name.trim(),
         region: sshForm.region.trim() || undefined,
         address: sshForm.address.trim(),
@@ -584,7 +589,7 @@ function EnrollmentModal({ onClose, onCreated }: { onClose: () => Promise<void> 
     </div>
   ) : (
     <form className="modal-form" onSubmit={submitToken}>
-      <label><span>服务器 ID</span><input required pattern="[a-zA-Z0-9][a-zA-Z0-9._-]{1,63}" value={form.id} onChange={(event) => setForm({ ...form, id: event.target.value })} placeholder="srv-sg-app" /></label>
+      <label><span>服务器 ID</span><input required pattern="[A-Za-z0-9][A-Za-z0-9._\-]{1,63}" value={form.id} onChange={(event) => setForm({ ...form, id: event.target.value })} placeholder="srv-sg-app" /></label>
       <label><span>显示名称</span><input required value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} placeholder="SG 应用节点" /></label>
       <div className="form-grid">
         <label><span>地区</span><input value={form.region} onChange={(event) => setForm({ ...form, region: event.target.value })} placeholder="新加坡" /></label>
@@ -597,17 +602,14 @@ function EnrollmentModal({ onClose, onCreated }: { onClose: () => Promise<void> 
   const sshBody = (
     <form className="modal-form enrollment-ssh-form" onSubmit={sshSubmit}>
       <div className="form-grid">
-        <label><span>服务器 ID</span><input required disabled={sshInputsDisabled} pattern="[a-zA-Z0-9][a-zA-Z0-9._-]{1,63}" value={sshForm.id} onChange={(event) => updateSsh({ id: event.target.value })} placeholder="srv-sg-app" /></label>
         <label><span>显示名称</span><input required disabled={sshInputsDisabled} value={sshForm.name} onChange={(event) => updateSsh({ name: event.target.value })} placeholder="SG 应用节点" /></label>
-      </div>
-      <div className="form-grid">
         <label><span>地区</span><input disabled={sshInputsDisabled} value={sshForm.region} onChange={(event) => updateSsh({ region: event.target.value })} placeholder="新加坡" /></label>
-        <label><span>主机地址</span><input required disabled={sshInputsDisabled} autoComplete="off" value={sshForm.address} onChange={(event) => updateSsh({ address: event.target.value })} placeholder="203.0.113.10" /></label>
       </div>
       <div className="form-grid">
+        <label><span>主机地址</span><input required disabled={sshInputsDisabled} autoComplete="off" value={sshForm.address} onChange={(event) => updateSsh({ address: event.target.value })} placeholder="203.0.113.10" /></label>
         <label><span>SSH 端口</span><input required disabled={sshInputsDisabled} type="number" inputMode="numeric" min="1" max="65535" value={sshForm.sshPort} onChange={(event) => updateSsh({ sshPort: event.target.value })} /></label>
-        <label><span>SSH 用户（仅 root）</span><input required readOnly disabled={sshInputsDisabled} autoComplete="username" value={sshForm.sshUsername} placeholder="root" /></label>
       </div>
+      <label><span>SSH 用户（仅 root）</span><input required readOnly disabled={sshInputsDisabled} autoComplete="username" value={sshForm.sshUsername} placeholder="root" /></label>
       <label><span>SSH 密码</span><input disabled={sshInputsDisabled} type="password" autoComplete="new-password" value={sshForm.password} onChange={(event) => updateSsh({ password: event.target.value })} placeholder={preflight ? "预检后重新输入" : "仅用于本次引导"} /></label>
       {rootUser ? <label className="bootstrap-check bootstrap-check--risk"><input disabled={sshInputsDisabled} type="checkbox" checked={sshForm.rootRiskAccepted} onChange={(event) => updateSsh({ rootRiskAccepted: event.target.checked })} /><span>我确认此次 root 引导符合服务器安全策略</span></label> : null}
       {preflight ? <div className="bootstrap-verification">
@@ -721,7 +723,7 @@ function ProjectModal({ servers, onClose, onCreated }: { servers: Server[]; onCl
       await onCreated();
     } catch (reason) { setError(reason instanceof Error ? reason.message : "登记失败"); } finally { setBusy(false); }
   };
-  return <div className="modal-shell"><section className="release-modal" role="dialog" aria-modal="true" aria-label="登记项目"><div className="modal-head"><div><span className="eyebrow"><Box size={14} /> 项目资产</span><h2>登记项目</h2></div><IconButton label="关闭" onClick={onClose}><X size={19} /></IconButton></div>{agentSnippet ? <div className="credential-result"><span className="success-badge"><CheckCircle2 size={24} /></span><h3>项目已登记</h3><p>将此对象加入对应 Agent 配置的 projects 数组，然后重启 Agent。</p><div className="credential-box"><pre>{agentSnippet}</pre><button type="button" title="复制 Agent 项目配置" onClick={() => void navigator.clipboard.writeText(agentSnippet)}><Clipboard size={16} /></button></div></div> : <form className="modal-form" onSubmit={submit}><div className="form-grid"><label><span>项目 ID</span><input required pattern="[a-zA-Z0-9][a-zA-Z0-9._-]{1,63}" value={form.id} onChange={(event) => setForm({ ...form, id: event.target.value })} placeholder="faceon" /></label><label><span>显示名称</span><input required value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} placeholder="FaceOn" /></label></div><label><span>服务器</span><select required value={form.serverId} onChange={(event) => setForm({ ...form, serverId: event.target.value })}><option value="">选择服务器</option>{servers.map((server) => <option key={server.id} value={server.id}>{server.name}</option>)}</select></label><div className="form-grid"><label><span>运行类型</span><select value={form.type} onChange={(event) => setForm({ ...form, type: event.target.value })}><option value="Compose">Docker Compose</option><option value="systemd">systemd</option><option value="http">HTTP 探测</option></select></label><label><span>分支</span><input value={form.branch} onChange={(event) => setForm({ ...form, branch: event.target.value })} placeholder="main" /></label></div><label><span>域名</span><input value={form.domain} onChange={(event) => setForm({ ...form, domain: event.target.value })} placeholder="app.example.com" /></label>{form.type === "Compose" ? <><label><span>工作目录</span><input required value={form.workingDirectory} onChange={(event) => setForm({ ...form, workingDirectory: event.target.value })} placeholder="/opt/app" /></label><div className="form-grid"><label><span>Compose 项目名</span><input value={form.composeProject} onChange={(event) => setForm({ ...form, composeProject: event.target.value })} placeholder={form.id || "compose project"} /></label><label><span>Compose 文件</span><input value={form.composeFile} onChange={(event) => setForm({ ...form, composeFile: event.target.value })} placeholder="compose.yaml" /></label></div></> : null}{form.type === "systemd" ? <label><span>service unit</span><input required value={form.unit} onChange={(event) => setForm({ ...form, unit: event.target.value })} placeholder="faceon.service" /></label> : null}{form.type !== "http" ? <label><span>回滚目标</span><input required value={form.rollbackRef} onChange={(event) => setForm({ ...form, rollbackRef: event.target.value })} placeholder={form.type === "Compose" ? "sha256:stable-image-digest" : "systemd:previous-stable"} /></label> : null}<label><span>健康检查 URL</span><input required={form.type === "http"} type="url" value={form.healthUrl} onChange={(event) => setForm({ ...form, healthUrl: event.target.value })} placeholder="https://app.example.com/api/health" /></label>{error ? <div className="inline-error"><AlertCircle size={16} />{error}</div> : null}</form>}<div className="modal-actions"><button className="button button--secondary" type="button" onClick={onClose}>{agentSnippet ? "完成" : "取消"}</button>{!agentSnippet ? <button className="button button--primary" type="button" disabled={busy || !form.serverId || !form.id || !form.name} onClick={() => (document.querySelector(".modal-form") as HTMLFormElement)?.requestSubmit()}>{busy ? <LoaderCircle className="spin" size={16} /> : <Plus size={16} />}登记项目</button> : null}</div></section></div>;
+  return <div className="modal-shell"><section className="release-modal" role="dialog" aria-modal="true" aria-label="登记项目"><div className="modal-head"><div><span className="eyebrow"><Box size={14} /> 项目资产</span><h2>登记项目</h2></div><IconButton label="关闭" onClick={onClose}><X size={19} /></IconButton></div>{agentSnippet ? <div className="credential-result"><span className="success-badge"><CheckCircle2 size={24} /></span><h3>项目已登记</h3><p>将此对象加入对应 Agent 配置的 projects 数组，然后重启 Agent。</p><div className="credential-box"><pre>{agentSnippet}</pre><button type="button" title="复制 Agent 项目配置" onClick={() => void navigator.clipboard.writeText(agentSnippet)}><Clipboard size={16} /></button></div></div> : <form className="modal-form" onSubmit={submit}><div className="form-grid"><label><span>项目 ID</span><input required pattern="[A-Za-z0-9][A-Za-z0-9._\-]{1,63}" value={form.id} onChange={(event) => setForm({ ...form, id: event.target.value })} placeholder="faceon" /></label><label><span>显示名称</span><input required value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} placeholder="FaceOn" /></label></div><label><span>服务器</span><select required value={form.serverId} onChange={(event) => setForm({ ...form, serverId: event.target.value })}><option value="">选择服务器</option>{servers.map((server) => <option key={server.id} value={server.id}>{server.name}</option>)}</select></label><div className="form-grid"><label><span>运行类型</span><select value={form.type} onChange={(event) => setForm({ ...form, type: event.target.value })}><option value="Compose">Docker Compose</option><option value="systemd">systemd</option><option value="http">HTTP 探测</option></select></label><label><span>分支</span><input value={form.branch} onChange={(event) => setForm({ ...form, branch: event.target.value })} placeholder="main" /></label></div><label><span>域名</span><input value={form.domain} onChange={(event) => setForm({ ...form, domain: event.target.value })} placeholder="app.example.com" /></label>{form.type === "Compose" ? <><label><span>工作目录</span><input required value={form.workingDirectory} onChange={(event) => setForm({ ...form, workingDirectory: event.target.value })} placeholder="/opt/app" /></label><div className="form-grid"><label><span>Compose 项目名</span><input value={form.composeProject} onChange={(event) => setForm({ ...form, composeProject: event.target.value })} placeholder={form.id || "compose project"} /></label><label><span>Compose 文件</span><input value={form.composeFile} onChange={(event) => setForm({ ...form, composeFile: event.target.value })} placeholder="compose.yaml" /></label></div></> : null}{form.type === "systemd" ? <label><span>service unit</span><input required value={form.unit} onChange={(event) => setForm({ ...form, unit: event.target.value })} placeholder="faceon.service" /></label> : null}{form.type !== "http" ? <label><span>回滚目标</span><input required value={form.rollbackRef} onChange={(event) => setForm({ ...form, rollbackRef: event.target.value })} placeholder={form.type === "Compose" ? "sha256:stable-image-digest" : "systemd:previous-stable"} /></label> : null}<label><span>健康检查 URL</span><input required={form.type === "http"} type="url" value={form.healthUrl} onChange={(event) => setForm({ ...form, healthUrl: event.target.value })} placeholder="https://app.example.com/api/health" /></label>{error ? <div className="inline-error"><AlertCircle size={16} />{error}</div> : null}</form>}<div className="modal-actions"><button className="button button--secondary" type="button" onClick={onClose}>{agentSnippet ? "完成" : "取消"}</button>{!agentSnippet ? <button className="button button--primary" type="button" disabled={busy || !form.serverId || !form.id || !form.name} onClick={() => (document.querySelector(".modal-form") as HTMLFormElement)?.requestSubmit()}>{busy ? <LoaderCircle className="spin" size={16} /> : <Plus size={16} />}登记项目</button> : null}</div></section></div>;
 }
 
 function AuthBrand() {
