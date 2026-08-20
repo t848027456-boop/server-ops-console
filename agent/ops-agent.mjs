@@ -9,7 +9,7 @@ import { promisify } from "node:util";
 import WebSocket from "ws";
 
 const execFileAsync = promisify(execFile);
-const AGENT_VERSION = "0.2.0";
+const AGENT_VERSION = "0.2.1";
 const DEFAULT_INTERVAL_MS = 10_000;
 const MAX_OUTPUT_BYTES = 2 * 1024 * 1024;
 const MAX_INTERNAL_DOCKER_CONTAINERS = 256;
@@ -239,7 +239,7 @@ async function getDockerSnapshot(projects = []) {
 
   const validIds = parsedContainers.map((item) => item.id).filter((id) => /^[a-f0-9]{12,64}$/i.test(id));
   if (validIds.length > 0) {
-    const inspectFormat = "[{{json .Id}},{{json .RestartCount}},{{json .State.Status}},{{if .State.Health}}{{json .State.Health.Status}}{{else}}null{{end}},{{json (index .Config.Labels \"com.docker.compose.project\")}},{{json (index .Config.Labels \"com.docker.compose.service\")}},{{json (index .Config.Labels \"com.docker.compose.project.working_dir\")}},{{json (index .Config.Labels \"com.docker.compose.project.config_files\")}}]";
+    const inspectFormat = "[{{json .Id}},{{json .RestartCount}},{{json .State.Status}},{{if (index .State \"Health\")}}{{json (index (index .State \"Health\") \"Status\")}}{{else}}null{{end}},{{json (index .Config.Labels \"com.docker.compose.project\")}},{{json (index .Config.Labels \"com.docker.compose.service\")}},{{json (index .Config.Labels \"com.docker.compose.project.working_dir\")}},{{json (index .Config.Labels \"com.docker.compose.project.config_files\")}}]";
     const batches = [];
     for (let index = 0; index < validIds.length; index += 128) batches.push(validIds.slice(index, index + 128));
     const inspections = await Promise.all(batches.map((batch) => runProgram(
