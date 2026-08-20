@@ -13,6 +13,8 @@ node agent/dist/ops-agent.cjs --config agent.config.json --once
 
 `--once` 会采集真实 CPU、内存、磁盘、Docker、systemd 和项目健康检查，但不会连接控制端或执行任务。
 
+常驻运行时，Agent 会在心跳中自动上报 Docker 容器的 Compose 归属、镜像、状态、端口摘要，以及运行中的 systemd 服务。该清单仅用于资产盘点；不会上传容器环境变量、完整 labels、挂载内容或配置文件内容，也不会因此扩大可执行动作范围。
+
 ## Linux 安装
 
 手动安装前确认目标机为使用 systemd 和 glibc 的 Debian/Ubuntu x64 或 arm64，并且 systemd unit 使用的 `/usr/bin/node` 为 22 或更高版本：
@@ -52,6 +54,8 @@ SSH 自动接入不会添加软件源或替换系统 Node.js。需要托管运�
 - `http`：至少登记一个 HTTP 健康检查。
 
 控制台的“登记项目”会生成可加入 `projects` 数组的 Agent 配置片段。修改配置后重启 Agent，控制端与 Agent 的项目 ID 必须一致。
+
+“项目”页中的自动发现清单和这里的 `projects` 配置是两层数据：前者只读展示服务器实际运行资产，后者才定义健康检查和允许动作。不要把数据库、反向代理等基础设施仅因被发现就自动登记为业务项目。
 
 ## 当前真实动作
 

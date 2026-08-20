@@ -42,10 +42,11 @@ import {
   X,
 } from "lucide-react";
 import { AUTH_REQUIRED_EVENT, ApiError, api, clearAdminToken, ensureBootstrapFlow, getStoredAdminToken, isUnauthorized, rememberBootstrapJob, storeAdminToken, waitForTask } from "./api";
-import type { AlertItem, AuditItem, BootstrapJob, BootstrapPreflight, Health, Overview, Project, Server, Task } from "./data";
+import type { AlertItem, AuditItem, BootstrapJob, BootstrapPreflight, DockerInventoryContainer, Health, Overview, Project, Server, SystemdInventoryService, Task } from "./data";
 
 type Page = "dashboard" | "servers" | "projects" | "releases" | "alerts" | "audit";
 type ProjectFilter = "all" | "issues" | "actions";
+type ProjectView = "registered" | "compose" | "systemd";
 type ServerFilter = "all" | "online" | "issues";
 type AlertFilter = "unresolved" | "all";
 
@@ -61,7 +62,7 @@ const emptyOverview: Overview = {
 const pageTitles: Record<Page, { title: string; subtitle: string }> = {
   dashboard: { title: "运维总览", subtitle: "来自已连接 Agent 的实时状态" },
   servers: { title: "服务器", subtitle: "主机资源、服务和 Agent 连接状态" },
-  projects: { title: "项目", subtitle: "进程、内部接口和公网入口的分层状态" },
+  projects: { title: "项目与服务", subtitle: "区分已登记项目与 Agent 自动发现的实际运行服务" },
   releases: { title: "任务中心", subtitle: "真实操作、发布预检和执行记录" },
   alerts: { title: "告警", subtitle: "按影响范围排序的异常事件" },
   audit: { title: "审计日志", subtitle: "控制端最近保存的写操作记录" },
@@ -125,6 +126,53 @@ function relativeTime(value: string | null | undefined) {
 
 function Status({ health, withLabel = true }: { health: Health; withLabel?: boolean }) {
   return <span className={`status status--${health}`}><span className="status__dot" />{withLabel ? healthText[health] : null}</span>;
+}
+
+const runtimeStateText: Record<string, string> = {
+  active: "活跃",
+  activating: "启动中",
+  created: "已创建",
+  dead: "已终止",
+  deactivating: "停止中",
+  exited: "已退出",
+  failed: "失败",
+  healthy: "健康",
+  inactive: "未运行",
+  paused: "已暂停",
+  reloading: "重载中",
+  restarting: "重启中",
+  running: "运行中",
+  starting: "检查中",
+  unhealthy: "异常",
+};
+
+function runtimeTone(value: string): Health {
+  const normalized = value.trim().toLowerCase();
+  if (["active", "healthy", "running"].includes(normalized)) return "healthy";
+  if (["activating", "created", "deactivating", "paused", "reloading", "restarting", "starting"].includes(normalized)) return "warning";
+  if (["dead", "exited", "failed", "unhealthy"].includes(normalized)) return "critical";
+  if (normalized === "inactive") return "offline";
+  return "unknown";
+}
+
+function RuntimeStatus({ value, tone }: { value: string; tone?: Health }) {
+  const normalized = value.trim().toLowerCase() || "unknown";
+  const label = runtimeStateText[normalized] || value || "未知";
+  return <span className={`runtime-status runtime-status--${tone || runtimeTone(normalized)}`} title={value || "unknown"}><span className="runtime-status__dot" /><span><strong>{label}</strong>{label.toLowerCase() !== normalized ? <small>{normalized}</small> : null}</span></span>;
+}
+
+function composeGroups(containers: DockerInventoryContainer[]) {
+  const groups = new Map<string, { name: string; containers: DockerInventoryContainer[] }>();
+  containers.forEach((container) => {
+    const name = container.composeProject || container.name || "独立容器";
+    const key = container.composeProject ? `compose:${container.composeProject}` : `standalone:${container.id || container.name}`;
+    const group = groups.get(key) || { name, containers: [] };
+    group.containers.push(container);
+    groups.set(key, group);
+  });
+  return [...groups.entries()]
+    .map(([key, group]) => ({ key, ...group, containers: [...group.containers].sort((left, right) => (left.composeService || left.name).localeCompare(right.composeService || right.name)) }))
+    .sort((left, right) => left.name.localeCompare(right.name));
 }
 
 function PercentBar({ value, warning = 80 }: { value: number; warning?: number }) {
@@ -224,14 +272,75 @@ function ServersView({ servers, bootstrapJobs, onSelect, onEnroll, onHistory }: 
   return <section className="panel panel--table page-panel"><div className="toolbar-row"><div className="segmented"><button className={filter === "all" ? "is-active" : ""} type="button" onClick={() => setFilter("all")}>全部 {servers.length}</button><button className={filter === "online" ? "is-active" : ""} type="button" onClick={() => setFilter("online")}>在线 {servers.filter((server) => server.agentConnected).length}</button><button className={filter === "issues" ? "is-active" : ""} type="button" onClick={() => setFilter("issues")}>异常 {servers.filter(hasIssue).length}</button></div><div className="toolbar-actions"><button className={`button button--secondary${needsReview ? " button--attention" : ""}`} type="button" onClick={onHistory}><History size={16} /> 接入记录{needsReview ? <span className="button-badge">{needsReview}</span> : null}</button><button className="button button--secondary" type="button" onClick={onEnroll}><CloudCog size={16} /> 接入服务器</button></div></div>{visible.length || !servers.length ? <ServerTable servers={visible} onSelect={onSelect} /> : <EmptyState title="没有符合条件的服务器" detail="切换筛选条件可查看其他服务器。" />}</section>;
 }
 
+function RuntimeServerHeading({ server, count, kind }: { server: Server; count: number; kind: "docker" | "systemd" }) {
+  const inventory = server.runtimeInventory;
+  const available = kind === "docker" ? inventory?.docker.available : inventory?.systemd.available;
+  const version = kind === "docker" && inventory?.docker.version ? `Docker ${inventory.docker.version}` : null;
+  const stale = server.health === "offline" || !server.runtimeInventoryFresh;
+  return <div className="runtime-server-heading"><div className="runtime-server-identity"><span className="server-glyph"><ServerIcon size={16} /></span><span><strong>{server.name}</strong><small>{server.address || "未上报地址"}</small></span></div><div className="runtime-server-meta"><span>{count} 个服务</span>{inventory ? <span>{version || (available ? "服务管理器可用" : "服务管理器不可用")}</span> : <span>等待运行清单</span>}{stale && inventory ? <span className="runtime-server-meta__stale">离线快照</span> : null}{inventory ? <span>采集于 {relativeTime(inventory.collectedAt)}</span> : null}</div></div>;
+}
+
+function RuntimeInlineEmpty({ icon, title, detail }: { icon: ReactNode; title: string; detail: string }) {
+  return <div className="runtime-inline-empty">{icon}<span><strong>{title}</strong><small>{detail}</small></span></div>;
+}
+
+function ComposeInventoryView({ servers }: { servers: Server[] }) {
+  if (!servers.length) return <EmptyState title="没有可盘点的服务器" detail="接入 Agent 后，Docker 和 Compose 运行清单会随心跳自动上报。" />;
+  return <div className="runtime-groups">{servers.map((server) => {
+    const inventory = server.runtimeInventory;
+    const containers = inventory?.docker.containers || [];
+    const groups = composeGroups(containers);
+    const stale = server.health === "offline" || !server.runtimeInventoryFresh;
+    return <section className="runtime-server-group" key={server.id} aria-label={`${server.name} 的 Compose 服务`}><RuntimeServerHeading server={server} count={containers.length} kind="docker" />
+      {!inventory ? <RuntimeInlineEmpty icon={<RefreshCw size={18} />} title="尚未收到运行清单" detail={server.agentConnected ? "Agent 将在下一次心跳自动上报，无需手工登记。" : "Agent 当前未连接，恢复后会自动采集。"} /> : !inventory.docker.available ? <RuntimeInlineEmpty icon={<Box size={18} />} title="Docker 清单不可用" detail="Agent 未能读取 Docker 容器清单，请检查 Docker 权限或服务状态。" /> : !containers.length ? <RuntimeInlineEmpty icon={inventory.docker.truncated ? <AlertTriangle size={18} /> : <CheckCircle2 size={18} />} title={inventory.docker.truncated ? "Docker 清单已截断" : "没有发现 Docker 容器"} detail={inventory.docker.truncated ? "本次采集超出安全上限，无法确认完整服务数量。" : "本次只读盘点已完成，当前清单为空。"} /> : <><div className="runtime-table-wrap"><table className="runtime-table compose-runtime-table"><caption className="sr-only">{server.name} 自动发现的 Docker Compose 服务</caption><thead><tr><th>Compose 服务</th><th>容器状态</th><th>健康检查</th><th>镜像</th><th>端口映射</th><th>重启</th><th>容器 ID</th></tr></thead>{groups.map((group) => {
+        const directories = [...new Set(group.containers.flatMap((container) => container.workingDirectory ? [container.workingDirectory] : []))];
+        const files = [...new Set(group.containers.flatMap((container) => container.configFiles))];
+        const definition = [directories.length === 1 ? directories[0] : directories.length > 1 ? `${directories.length} 个工作目录` : "未上报工作目录", files.length ? `${files.length} 个 Compose 文件` : null].filter(Boolean).join(" · ");
+        return <tbody key={group.key}><tr className="runtime-subgroup-row"><th colSpan={7} scope="rowgroup"><div><span><Box size={15} /><strong>{group.name}</strong><small title={[...directories, ...files].join("\n")}>{definition}</small></span><b>{group.containers.length} 个容器</b></div></th></tr>{group.containers.map((container) => {
+          const independentHealth = Boolean(container.health.trim()) && container.health.trim().toLowerCase() !== container.state.trim().toLowerCase();
+          return <tr key={`${container.id}-${container.name}`}><td data-label="Compose 服务"><div className="runtime-primary"><strong>{container.composeService || container.name}</strong>{container.composeService && container.composeService !== container.name ? <small>{container.name}</small> : null}</div></td><td data-label="容器状态"><RuntimeStatus value={container.state} tone={stale ? "unknown" : undefined} /></td><td data-label="健康检查">{independentHealth ? <RuntimeStatus value={container.health} tone={stale ? "unknown" : undefined} /> : <span className="runtime-muted-value"><strong>未配置</strong><small>随容器状态</small></span>}</td><td data-label="镜像"><code className="runtime-code" title={container.image}>{container.image || "unknown"}</code></td><td data-label="端口映射"><code className="runtime-code runtime-code--ports" title={container.ports}>{container.ports || "无发布端口"}</code></td><td data-label="重启"><strong className={container.restartCount > 0 ? "text-warning" : "muted"}>{container.restartCount}</strong></td><td data-label="容器 ID"><code>{container.id.slice(0, 12) || "unknown"}</code></td></tr>;
+        })}</tbody>;
+      })}</table></div>{inventory.docker.truncated ? <div className="runtime-truncated"><AlertTriangle size={15} /><span>容器清单达到采集上限，当前显示的是安全截断后的结果。</span></div> : null}</>}
+    </section>;
+  })}</div>;
+}
+
+function SystemdInventoryView({ servers }: { servers: Server[] }) {
+  if (!servers.length) return <EmptyState title="没有可盘点的服务器" detail="接入 Agent 后，systemd 运行服务会随心跳自动上报。" />;
+  return <div className="runtime-groups">{servers.map((server) => {
+    const inventory = server.runtimeInventory;
+    const services = [...(inventory?.systemd.services || [])].sort((left, right) => left.unit.localeCompare(right.unit));
+    const stale = server.health === "offline" || !server.runtimeInventoryFresh;
+    return <section className="runtime-server-group" key={server.id} aria-label={`${server.name} 的 systemd 服务`}><RuntimeServerHeading server={server} count={services.length} kind="systemd" />
+      {!inventory ? <RuntimeInlineEmpty icon={<RefreshCw size={18} />} title="尚未收到运行清单" detail={server.agentConnected ? "Agent 将在下一次心跳自动上报，无需手工登记。" : "Agent 当前未连接，恢复后会自动采集。"} /> : !inventory.systemd.available ? <RuntimeInlineEmpty icon={<Terminal size={18} />} title="systemd 清单不可用" detail="Agent 未能读取 systemd 服务清单，请检查 systemd 权限或运行状态。" /> : !services.length ? <RuntimeInlineEmpty icon={inventory.systemd.truncated ? <AlertTriangle size={18} /> : <CheckCircle2 size={18} />} title={inventory.systemd.truncated ? "systemd 清单已截断" : "没有发现 systemd 服务"} detail={inventory.systemd.truncated ? "本次采集超出安全上限，无法确认完整服务数量。" : "本次只读盘点已完成，当前清单为空。"} /> : <><div className="runtime-table-wrap"><table className="runtime-table systemd-runtime-table"><caption className="sr-only">{server.name} 自动发现的 systemd 服务</caption><thead><tr><th>Unit</th><th>说明</th><th>Active</th><th>Sub</th></tr></thead><tbody>{services.map((service: SystemdInventoryService) => <tr key={service.unit}><td data-label="Unit"><div className="runtime-primary"><strong>{service.unit}</strong></div></td><td data-label="说明"><span className="runtime-description" title={service.description}>{service.description || "未提供说明"}</span></td><td data-label="Active"><RuntimeStatus value={service.activeState} tone={stale ? "unknown" : undefined} /></td><td data-label="Sub"><RuntimeStatus value={service.subState} tone={stale ? "unknown" : runtimeTone(service.activeState) === "healthy" && service.subState.trim().toLowerCase() === "exited" ? "healthy" : undefined} /></td></tr>)}</tbody></table></div>{inventory.systemd.truncated ? <div className="runtime-truncated"><AlertTriangle size={15} /><span>systemd 清单达到采集上限，当前显示的是安全截断后的结果。</span></div> : null}</>}
+    </section>;
+  })}</div>;
+}
+
 function ProjectsView({ projects, servers, onSelect, onPreflight, onRegister }: { projects: Project[]; servers: Server[]; onSelect: (project: Project) => void; onPreflight: (project: Project) => void; onRegister: () => void }) {
+  const [view, setView] = useState<ProjectView>("registered");
   const [filter, setFilter] = useState<ProjectFilter>("all");
+  const [serverScope, setServerScope] = useState("all");
+  const scopedServers = serverScope === "all" ? servers : servers.filter((server) => server.id === serverScope);
+  const scopedServerIds = new Set(scopedServers.map((server) => server.id));
+  const scopedProjects = projects.filter((project) => scopedServerIds.has(project.serverId));
   const onlineServerIds = new Set(servers.filter((server) => server.agentConnected).map((server) => server.id));
   const operable = (project: Project) => onlineServerIds.has(project.serverId) && project.allowedActions.length > 1;
   const hasIssue = (project: Project) => ["warning", "critical", "offline", "unknown"].includes(project.health);
-  const visible = projects.filter((project) => filter === "issues" ? hasIssue(project) : filter === "actions" ? operable(project) : true);
-  return <section className="panel panel--table page-panel"><div className="toolbar-row"><div className="segmented"><button className={filter === "all" ? "is-active" : ""} type="button" onClick={() => setFilter("all")}>全部 {projects.length}</button><button className={filter === "issues" ? "is-active" : ""} type="button" onClick={() => setFilter("issues")}>异常 {projects.filter(hasIssue).length}</button><button className={filter === "actions" ? "is-active" : ""} type="button" onClick={() => setFilter("actions")}>可操作 {projects.filter(operable).length}</button></div><button className="button button--secondary" type="button" onClick={onRegister}><Plus size={16} /> 登记项目</button></div>
-    {!visible.length ? <EmptyState title="没有符合条件的项目" detail="项目登记后，Agent 会按相同项目 ID 上报真实健康状态。" /> : <div className="table-wrap"><table className="data-table project-table"><thead><tr><th>项目</th><th>运行状态</th><th>公网检查</th><th>当前版本</th><th>服务器</th><th>最近更新</th><th /></tr></thead><tbody>{visible.map((project) => { const serverConnected = onlineServerIds.has(project.serverId); return <tr key={project.id} onClick={() => onSelect(project)}><td><div className="primary-cell"><span className="project-glyph"><Code2 size={17} /></span><span><strong>{project.name}</strong><small>{project.type} · {project.domain || "未配置域名"}</small></span></div></td><td><Status health={project.health} /></td><td><div className="probe-cell"><Status health={project.externalHealth} />{project.responseTime !== null ? <small>{project.responseTime}ms</small> : null}</div></td><td><div className="version-cell"><code>{project.version || "unknown"}</code><small>{project.digest || "未上报摘要"}</small></div></td><td>{project.server}</td><td className="muted">{relativeTime(project.updatedAt)}</td><td>{project.allowedActions.includes("release-preflight") || project.allowedActions.includes("release") ? <button className="small-action" type="button" disabled={!serverConnected} title={serverConnected ? "运行发布预检" : "Agent 未连接"} onClick={(event) => { event.stopPropagation(); onPreflight(project); }}>预检</button> : <ChevronRight className="row-arrow" size={17} />}</td></tr>; })}</tbody></table></div>}
+  const visible = scopedProjects.filter((project) => filter === "issues" ? hasIssue(project) : filter === "actions" ? operable(project) : true);
+  const composeCount = scopedServers.reduce((total, server) => total + (server.runtimeInventory?.docker.containers.length || 0), 0);
+  const composeGroupCount = scopedServers.reduce((total, server) => total + composeGroups(server.runtimeInventory?.docker.containers || []).length, 0);
+  const systemdCount = scopedServers.reduce((total, server) => total + (server.runtimeInventory?.systemd.services.length || 0), 0);
+  const composeHealthy = scopedServers.reduce((total, server) => total + (server.health === "offline" || !server.runtimeInventoryFresh ? 0 : server.runtimeInventory?.docker.containers.filter((container) => {
+    const state = container.state.trim().toLowerCase();
+    const health = container.health.trim().toLowerCase();
+    return runtimeTone(health && health !== state ? health : state) === "healthy";
+  }).length || 0), 0);
+  const systemdHealthy = scopedServers.reduce((total, server) => total + (server.health === "offline" || !server.runtimeInventoryFresh ? 0 : server.runtimeInventory?.systemd.services.filter((service) => runtimeTone(service.activeState) === "healthy").length || 0), 0);
+  const inventoryCoverage = scopedServers.filter((server) => server.runtimeInventory && server.runtimeInventoryFresh).length;
+  return <section className="panel panel--table page-panel project-inventory-panel"><div className="project-inventory-head"><div className="asset-tabs" role="tablist" aria-label="项目与运行服务视图"><button className={view === "registered" ? "is-active" : ""} type="button" role="tab" aria-selected={view === "registered"} aria-controls="project-view-panel" onClick={() => setView("registered")}><ListChecks size={15} /><span>已登记项目</span><b>{scopedProjects.length}</b></button><button className={view === "compose" ? "is-active" : ""} type="button" role="tab" aria-selected={view === "compose"} aria-controls="project-view-panel" onClick={() => setView("compose")}><Box size={15} /><span>Compose 服务</span><b>{composeGroupCount}</b></button><button className={view === "systemd" ? "is-active" : ""} type="button" role="tab" aria-selected={view === "systemd"} aria-controls="project-view-panel" onClick={() => setView("systemd")}><Terminal size={15} /><span>systemd 服务</span><b>{systemdCount}</b></button></div><label className="server-scope-filter"><span><ServerIcon size={14} /> 服务器</span><select aria-label="按服务器筛选项目和运行服务" value={serverScope} onChange={(event) => setServerScope(event.target.value)}><option value="all">全部服务器</option>{servers.map((server) => <option value={server.id} key={server.id}>{server.name}</option>)}</select></label></div>
+    {view === "registered" ? <div className="toolbar-row inventory-subtoolbar"><div className="segmented" role="group" aria-label="筛选已登记项目"><button className={filter === "all" ? "is-active" : ""} type="button" onClick={() => setFilter("all")}>全部 {scopedProjects.length}</button><button className={filter === "issues" ? "is-active" : ""} type="button" onClick={() => setFilter("issues")}>异常 {scopedProjects.filter(hasIssue).length}</button><button className={filter === "actions" ? "is-active" : ""} type="button" onClick={() => setFilter("actions")}>可操作 {scopedProjects.filter(operable).length}</button></div><button className="button button--secondary" type="button" onClick={onRegister}><Plus size={16} /> 登记项目</button></div> : <div className="inventory-subtoolbar runtime-summary-bar"><div><strong>{view === "compose" ? `${composeHealthy} / ${composeCount}` : `${systemdHealthy} / ${systemdCount}`}</strong><span>{view === "compose" ? "容器状态正常" : "systemd 服务活跃"}</span>{view === "compose" ? <small>{composeGroupCount} 个 Compose / 独立容器组</small> : null}<small>已采集 {inventoryCoverage} / {scopedServers.length} 台服务器</small></div><span className="readonly-indicator"><Eye size={14} /> Agent 只读盘点</span></div>}
+    <div id="project-view-panel" role="tabpanel" aria-label={view === "registered" ? "已登记项目" : view === "compose" ? "自动发现的 Compose 服务" : "自动发现的 systemd 服务"}>{view === "registered" ? (!visible.length ? <EmptyState title="没有符合条件的已登记项目" detail="这里仅显示主动纳管的项目；请切换到 Compose 或 systemd 查看 Agent 自动发现的实际运行服务。" /> : <div className="table-wrap"><table className="data-table project-table"><thead><tr><th>项目</th><th>运行状态</th><th>公网检查</th><th>当前版本</th><th>服务器</th><th>最近更新</th><th /></tr></thead><tbody>{visible.map((project) => { const serverConnected = onlineServerIds.has(project.serverId); return <tr key={project.id} onClick={() => onSelect(project)}><td><div className="primary-cell"><span className="project-glyph"><Code2 size={17} /></span><span><strong>{project.name}</strong><small>{project.type} · {project.domain || "未配置域名"}</small></span></div></td><td><Status health={project.health} /></td><td><div className="probe-cell"><Status health={project.externalHealth} />{project.responseTime !== null ? <small>{project.responseTime}ms</small> : null}</div></td><td><div className="version-cell"><code>{project.version || "unknown"}</code><small>{project.digest || "未上报摘要"}</small></div></td><td>{project.server}</td><td className="muted">{relativeTime(project.updatedAt)}</td><td>{project.allowedActions.includes("release-preflight") || project.allowedActions.includes("release") ? <button className="small-action" type="button" disabled={!serverConnected} title={serverConnected ? "运行发布预检" : "Agent 未连接"} onClick={(event) => { event.stopPropagation(); onPreflight(project); }}>预检</button> : <ChevronRight className="row-arrow" size={17} />}</td></tr>; })}</tbody></table></div>) : view === "compose" ? <ComposeInventoryView servers={scopedServers} /> : <SystemdInventoryView servers={scopedServers} />}</div>
   </section>;
 }
 
@@ -308,8 +417,15 @@ function AuditView({ items }: { items: AuditItem[] }) {
 
 function ServerDrawer({ server, projects, onClose, onProject, onRefresh }: { server: Server; projects: Project[]; onClose: () => void; onProject: (project: Project) => void; onRefresh: (server: Server) => Promise<void> }) {
   const related = projects.filter((project) => project.serverId === server.id);
+  const inventory = server.runtimeInventory;
+  const containers = inventory?.docker.containers || [];
+  const systemdServices = inventory?.systemd.services || [];
+  const composeProjects = composeGroups(containers).length;
+  const runningContainers = containers.filter((container) => runtimeTone(container.state) === "healthy").length;
+  const activeSystemd = systemdServices.filter((service) => runtimeTone(service.activeState) === "healthy").length;
+  const inventoryStale = server.health === "offline" || !server.runtimeInventoryFresh;
   const [busy, setBusy] = useState(false);
-  return <div className="drawer-shell" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><aside className="drawer" role="dialog" aria-modal="true" aria-label={`${server.name}详情`}><div className="drawer-head"><div className="drawer-title"><span className="server-glyph server-glyph--large"><ServerIcon size={20} /></span><div><h2>{server.name}</h2><span>{server.os || "系统信息等待上报"} · {server.region || "未设置"}</span></div></div><IconButton label="关闭" onClick={onClose}><X size={19} /></IconButton></div><div className="drawer-body"><div className="identity-row"><Status health={server.health} /><code>{server.address || "未上报"}</code><span className="muted">心跳 {server.heartbeat}</span></div><section className="resource-grid"><div><span>CPU</span><strong>{Math.round(server.cpu)}%</strong><PercentBar value={server.cpu} /></div><div><span>内存</span><strong>{Math.round(server.memory)}%</strong><PercentBar value={server.memory} /></div><div><span>磁盘</span><strong>{Math.round(server.disk)}%</strong><PercentBar value={server.disk} /></div><div><span>负载</span><strong>{server.load || "0"}</strong><small>1 分钟</small></div></section><section className="drawer-section"><div className="section-title"><h3>运行项目</h3><span>{related.length} 个</span></div>{related.length ? <div className="compact-list">{related.map((project) => <button type="button" key={project.id} onClick={() => onProject(project)}><span className="project-glyph"><Code2 size={16} /></span><span><strong>{project.name}</strong><small>{project.type} · {project.version || "unknown"}</small></span><Status health={project.health} /><ChevronRight size={16} /></button>)}</div> : <EmptyState title="未登记项目" detail="控制端和 Agent 配置需要使用相同项目 ID。" />}</section><section className="drawer-section"><div className="section-title"><h3>Agent</h3><span>{server.agentVersion || "未上报版本"}</span></div><div className="service-list"><div><span><ShieldCheck size={16} /> 实时连接</span><Status health={server.agentConnected ? "healthy" : server.health === "offline" ? "offline" : "unknown"} /></div><div><span><Network size={16} /> 最近心跳</span><strong>{server.heartbeat}</strong></div></div></section></div><div className="drawer-actions"><button className="button button--secondary" type="button" disabled={busy || !server.agentConnected} onClick={() => { setBusy(true); void onRefresh(server).finally(() => setBusy(false)); }}>{busy ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />} 刷新状态</button></div></aside></div>;
+  return <div className="drawer-shell" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><aside className="drawer" role="dialog" aria-modal="true" aria-label={`${server.name}详情`}><div className="drawer-head"><div className="drawer-title"><span className="server-glyph server-glyph--large"><ServerIcon size={20} /></span><div><h2>{server.name}</h2><span>{server.os || "系统信息等待上报"} · {server.region || "未设置"}</span></div></div><IconButton label="关闭" onClick={onClose}><X size={19} /></IconButton></div><div className="drawer-body"><div className="identity-row"><Status health={server.health} /><code>{server.address || "未上报"}</code><span className="muted">心跳 {server.heartbeat}</span></div><section className="resource-grid"><div><span>CPU</span><strong>{Math.round(server.cpu)}%</strong><PercentBar value={server.cpu} /></div><div><span>内存</span><strong>{Math.round(server.memory)}%</strong><PercentBar value={server.memory} /></div><div><span>磁盘</span><strong>{Math.round(server.disk)}%</strong><PercentBar value={server.disk} /></div><div><span>负载</span><strong>{server.load || "0"}</strong><small>1 分钟</small></div></section><section className="drawer-section"><div className="section-title"><h3>自动发现</h3><span>{inventory ? `${inventoryStale ? "离线快照 · " : ""}采集于 ${relativeTime(inventory.collectedAt)}` : "等待运行清单"}</span></div>{inventory ? <><div className="inventory-summary"><div><span className="inventory-summary__icon"><Box size={16} /></span><span><strong>Compose / 容器</strong><small>{inventory.docker.available ? `${composeProjects} 个 Compose 组 · ${runningContainers} / ${containers.length} 运行` : "Docker 不可用"}{inventory.docker.version ? ` · ${inventory.docker.version}` : ""}</small></span><b>{containers.length}</b></div><div><span className="inventory-summary__icon"><Terminal size={16} /></span><span><strong>systemd 服务</strong><small>{inventory.systemd.available ? `${activeSystemd} / ${systemdServices.length} 活跃` : "systemd 不可用"}</small></span><b>{systemdServices.length}</b></div></div>{inventory.docker.truncated || inventory.systemd.truncated ? <div className="drawer-inventory-note"><AlertTriangle size={14} />部分运行清单已达到采集上限</div> : null}</> : <RuntimeInlineEmpty icon={<RefreshCw size={17} />} title="尚未收到运行清单" detail="刷新服务器或等待下一次 Agent 心跳后会自动采集。" />}</section><section className="drawer-section"><div className="section-title"><h3>已登记项目</h3><span>{related.length} 个可纳管资产</span></div>{related.length ? <div className="compact-list">{related.map((project) => <button type="button" key={project.id} onClick={() => onProject(project)}><span className="project-glyph"><Code2 size={16} /></span><span><strong>{project.name}</strong><small>{project.type} · {project.version || "unknown"}</small></span><Status health={project.health} /><ChevronRight size={16} /></button>)}</div> : <EmptyState title="未登记项目" detail="自动发现的服务仍会显示，但只有登记后才能执行受控操作。" />}</section><section className="drawer-section"><div className="section-title"><h3>Agent</h3><span>{server.agentVersion || "未上报版本"}</span></div><div className="service-list"><div><span><ShieldCheck size={16} /> 实时连接</span><Status health={server.agentConnected ? "healthy" : server.health === "offline" ? "offline" : "unknown"} /></div><div><span><Network size={16} /> 最近心跳</span><strong>{server.heartbeat}</strong></div></div></section></div><div className="drawer-actions"><button className="button button--secondary" type="button" disabled={busy || !server.agentConnected} onClick={() => { setBusy(true); void onRefresh(server).finally(() => setBusy(false)); }}>{busy ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />} 刷新状态</button></div></aside></div>;
 }
 
 function ProjectDrawer({ project, serverConnected, onClose, onPreflight, onRestart }: { project: Project; serverConnected: boolean; onClose: () => void; onPreflight: () => void; onRestart: () => Promise<void> }) {

@@ -2,6 +2,42 @@ export type Health = "healthy" | "warning" | "critical" | "offline" | "unknown";
 export type ProjectType = "Compose" | "systemd" | "http";
 export type TaskStatus = "queued" | "dispatched" | "running" | "succeeded" | "failed" | "cancelled";
 
+export interface DockerInventoryContainer {
+  id: string;
+  name: string;
+  image: string;
+  state: string;
+  health: string;
+  restartCount: number;
+  ports: string;
+  composeProject: string | null;
+  composeService: string | null;
+  workingDirectory: string | null;
+  configFiles: string[];
+}
+
+export interface SystemdInventoryService {
+  unit: string;
+  description: string;
+  activeState: string;
+  subState: string;
+}
+
+export interface RuntimeInventory {
+  collectedAt: string;
+  docker: {
+    available: boolean;
+    version: string | null;
+    truncated: boolean;
+    containers: DockerInventoryContainer[];
+  };
+  systemd: {
+    available: boolean;
+    truncated: boolean;
+    services: SystemdInventoryService[];
+  };
+}
+
 export interface Server {
   id: string;
   name: string;
@@ -20,6 +56,8 @@ export interface Server {
   agentVersion: string | null;
   agentConnected: boolean;
   maintenanceMode: boolean;
+  runtimeInventory: RuntimeInventory | null;
+  runtimeInventoryFresh: boolean;
 }
 
 export interface Project {

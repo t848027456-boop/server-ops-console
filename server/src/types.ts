@@ -18,6 +18,42 @@ export const taskKinds = [
 
 export type TaskKind = (typeof taskKinds)[number];
 
+export interface DockerInventoryContainer {
+  id: string;
+  name: string;
+  image: string;
+  state: string;
+  health: string;
+  restartCount: number;
+  ports: string;
+  composeProject: string | null;
+  composeService: string | null;
+  workingDirectory: string | null;
+  configFiles: string[];
+}
+
+export interface SystemdInventoryService {
+  unit: string;
+  description: string;
+  activeState: string;
+  subState: string;
+}
+
+export interface RuntimeInventory {
+  collectedAt: string;
+  docker: {
+    available: boolean;
+    version: string | null;
+    truncated: boolean;
+    containers: DockerInventoryContainer[];
+  };
+  systemd: {
+    available: boolean;
+    truncated: boolean;
+    services: SystemdInventoryService[];
+  };
+}
+
 export interface ServerRow {
   id: string;
   name: string;
@@ -31,6 +67,8 @@ export interface ServerRow {
   load: string;
   last_heartbeat: string | null;
   agent_version: string | null;
+  runtime_inventory_json: string | null;
+  runtime_inventory_fresh: number;
   agent_token_hash: string | null;
   maintenance_mode: number;
   created_at: string;
@@ -101,6 +139,7 @@ export interface AgentHeartbeat {
     address?: string;
     os?: string;
   };
+  inventory?: unknown;
   projects?: Array<{
     id: string;
     health?: Health;

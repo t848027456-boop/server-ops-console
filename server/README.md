@@ -151,8 +151,22 @@ Heartbeat payload:
 ```json
 {
   "type": "heartbeat",
-  "agentVersion": "0.1.0",
+  "agentVersion": "0.2.0",
   "metrics": { "cpu": 23.5, "memory": 51.2, "disk": 72.4, "load": 0.42 },
+  "inventory": {
+    "collectedAt": "2026-08-20T01:00:00.000Z",
+    "docker": {
+      "available": true,
+      "version": "27.5.1",
+      "truncated": false,
+      "containers": []
+    },
+    "systemd": {
+      "available": true,
+      "truncated": false,
+      "services": []
+    }
+  },
   "projects": [
     {
       "id": "faceon",
@@ -167,6 +181,8 @@ Heartbeat payload:
   ]
 }
 ```
+
+`inventory` is an optional read-only asset snapshot, so older Agents may omit it. The control plane persists only bounded allowlisted fields, ignores extra fields, and redacts suspicious inline secrets. If a heartbeat omits a new snapshot, the last valid inventory is retained but marked stale in the API as `runtimeInventoryFresh: false`. Discovery never creates a project or grants action permissions.
 
 The control plane sends typed `task` messages. The Agent reports progress using `task_started`, `task_event`, `task_completed`, or `task_failed`. Agent event data and results are redacted before persistence.
 

@@ -7,11 +7,26 @@ import type { Client } from "ssh2";
 import { BootstrapError, BootstrapManager } from "./bootstrap.js";
 import { OpsDatabase } from "./db.js";
 import { hashToken, parseBearer, redact, tokenMatches } from "./security.js";
-import { taskKinds, type AgentHeartbeat, type AgentMessage, type AgentSession, type Health, type ProjectRow, type ServerRow, type TaskKind, type TaskRow } from "./types.js";
+import { taskKinds, type AgentHeartbeat, type AgentMessage, type AgentSession, type Health, type ProjectRow, type RuntimeInventory, type ServerRow, type TaskKind, type TaskRow } from "./types.js";
 
 const terminalStatuses = new Set(["succeeded", "failed", "cancelled"]);
 const healthValues = new Set<Health>(["healthy", "warning", "critical", "offline", "unknown"]);
 const projectActions = new Set(["refresh", "restart", "release-preflight"]);
+const runtimeInventoryLimits = {
+  dockerContainers: 64,
+  systemdServices: 128,
+  configFiles: 4,
+  id: 64,
+  name: 128,
+  image: 256,
+  state: 32,
+  ports: 512,
+  composeName: 128,
+  path: 384,
+  unit: 160,
+  description: 256,
+  version: 100,
+} as const;
 const mimeTypes: Record<string, string> = {
   ".css": "text/css; charset=utf-8",
   ".html": "text/html; charset=utf-8",
@@ -121,6 +136,105 @@ function parseTimestamp(value: unknown) {
   if (typeof value !== "string") return new Date().toISOString();
   const time = Date.parse(value);
   return Number.isFinite(time) && Math.abs(Date.now() - time) < 5 * 60_000 ? new Date(time).toISOString() : new Date().toISOString();
+}
+
+function inventoryObject(value: unknown, field: string) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new HttpError(400, `${field} must be an object`);
+  }
+  return value as Record<string, unknown>;
+}
+
+function inventoryString(value: unknown, field: string, maximum: number): string;
+function inventoryString(value: unknown, field: string, maximum: number, nullable: true): string | null;
+function inventoryString(value: unknown, field: string, maximum: number, nullable = false): string | null {
+  if (nullable && (value === undefined || value === null || value === "")) return null;
+  if (typeof value !== "string" || !value.trim()) {
+    throw new HttpError(400, `${field} must be a non-empty string${nullable ? " or null" : ""}`);
+  }
+  return String(redact(value)).replace(/[\u0000-\u001f\u007f]/g, " ").trim().slice(0, maximum);
+}
+
+function inventoryBoolean(value: unknown, field: string, fallback?: boolean) {
+  if (value === undefined && fallback !== undefined) return fallback;
+  if (typeof value !== "boolean") throw new HttpError(400, `${field} must be a boolean`);
+  return value;
+}
+
+function sanitizeRuntimeInventory(value: unknown, receivedAt: string): RuntimeInventory | undefined {
+  if (value === undefined) return undefined;
+  const inventory = inventoryObject(value, "heartbeat.inventory");
+  if (inventory.collectedAt !== undefined && typeof inventory.collectedAt !== "string") {
+    throw new HttpError(400, "heartbeat.inventory.collectedAt must be a string");
+  }
+  const docker = inventoryObject(inventory.docker, "heartbeat.inventory.docker");
+  const systemd = inventoryObject(inventory.systemd, "heartbeat.inventory.systemd");
+  if (!Array.isArray(docker.containers)) throw new HttpError(400, "heartbeat.inventory.docker.containers must be an array");
+  if (!Array.isArray(systemd.services)) throw new HttpError(400, "heartbeat.inventory.systemd.services must be an array");
+
+  const containers = docker.containers.slice(0, runtimeInventoryLimits.dockerContainers).map((raw, index) => {
+    const item = inventoryObject(raw, `heartbeat.inventory.docker.containers[${index}]`);
+    if (!Array.isArray(item.configFiles) || item.configFiles.some((file) => typeof file !== "string" || !file.trim())) {
+      throw new HttpError(400, `heartbeat.inventory.docker.containers[${index}].configFiles must be an array of non-empty strings`);
+    }
+    if (typeof item.restartCount !== "number" || !Number.isFinite(item.restartCount)) {
+      throw new HttpError(400, `heartbeat.inventory.docker.containers[${index}].restartCount must be a finite number`);
+    }
+    return {
+      id: inventoryString(item.id, `heartbeat.inventory.docker.containers[${index}].id`, runtimeInventoryLimits.id),
+      name: inventoryString(item.name, `heartbeat.inventory.docker.containers[${index}].name`, runtimeInventoryLimits.name),
+      image: inventoryString(item.image, `heartbeat.inventory.docker.containers[${index}].image`, runtimeInventoryLimits.image),
+      state: inventoryString(item.state, `heartbeat.inventory.docker.containers[${index}].state`, runtimeInventoryLimits.state),
+      health: inventoryString(item.health, `heartbeat.inventory.docker.containers[${index}].health`, runtimeInventoryLimits.state),
+      restartCount: Math.min(1_000_000, Math.max(0, Math.floor(item.restartCount))),
+      ports: item.ports === "" ? "" : inventoryString(item.ports, `heartbeat.inventory.docker.containers[${index}].ports`, runtimeInventoryLimits.ports),
+      composeProject: inventoryString(item.composeProject, `heartbeat.inventory.docker.containers[${index}].composeProject`, runtimeInventoryLimits.composeName, true),
+      composeService: inventoryString(item.composeService, `heartbeat.inventory.docker.containers[${index}].composeService`, runtimeInventoryLimits.composeName, true),
+      workingDirectory: inventoryString(item.workingDirectory, `heartbeat.inventory.docker.containers[${index}].workingDirectory`, runtimeInventoryLimits.path, true),
+      configFiles: item.configFiles.slice(0, runtimeInventoryLimits.configFiles)
+        .map((file, fileIndex) => inventoryString(file, `heartbeat.inventory.docker.containers[${index}].configFiles[${fileIndex}]`, runtimeInventoryLimits.path)),
+    };
+  });
+
+  const services = systemd.services.slice(0, runtimeInventoryLimits.systemdServices).map((raw, index) => {
+    const item = inventoryObject(raw, `heartbeat.inventory.systemd.services[${index}]`);
+    return {
+      unit: inventoryString(item.unit, `heartbeat.inventory.systemd.services[${index}].unit`, runtimeInventoryLimits.unit),
+      description: inventoryString(item.description, `heartbeat.inventory.systemd.services[${index}].description`, runtimeInventoryLimits.description),
+      activeState: inventoryString(item.activeState, `heartbeat.inventory.systemd.services[${index}].activeState`, runtimeInventoryLimits.state),
+      subState: inventoryString(item.subState, `heartbeat.inventory.systemd.services[${index}].subState`, runtimeInventoryLimits.state),
+    };
+  });
+
+  const version = docker.version === undefined || docker.version === null || docker.version === ""
+    ? null
+    : inventoryString(docker.version, "heartbeat.inventory.docker.version", runtimeInventoryLimits.version);
+  return {
+    collectedAt: parseTimestamp(inventory.collectedAt ?? receivedAt),
+    docker: {
+      available: inventoryBoolean(docker.available, "heartbeat.inventory.docker.available"),
+      version,
+      truncated: inventoryBoolean(docker.truncated, "heartbeat.inventory.docker.truncated", false)
+        || docker.containers.length > runtimeInventoryLimits.dockerContainers,
+      containers,
+    },
+    systemd: {
+      available: inventoryBoolean(systemd.available, "heartbeat.inventory.systemd.available"),
+      truncated: inventoryBoolean(systemd.truncated, "heartbeat.inventory.systemd.truncated", false)
+        || systemd.services.length > runtimeInventoryLimits.systemdServices,
+      services,
+    },
+  };
+}
+
+function parseStoredRuntimeInventory(value: string | null): RuntimeInventory | null {
+  if (!value) return null;
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as RuntimeInventory : null;
+  } catch {
+    return null;
+  }
 }
 
 function parseLimit(url: URL, maximum = 500) {
@@ -254,6 +368,8 @@ export function createOpsServer(options: OpsServerOptions) {
       heartbeat: relativeHeartbeat(row.last_heartbeat),
       lastHeartbeat: row.last_heartbeat,
       agentVersion: row.agent_version,
+      runtimeInventory: parseStoredRuntimeInventory(row.runtime_inventory_json),
+      runtimeInventoryFresh: Boolean(row.runtime_inventory_fresh),
       agentConnected: sessions.has(row.id),
       maintenanceMode: Boolean(row.maintenance_mode),
       createdAt: row.created_at,
@@ -481,6 +597,8 @@ export function createOpsServer(options: OpsServerOptions) {
       }
       const previous = db.getServer(serverId);
       if (!previous) return;
+      const timestamp = new Date().toISOString();
+      const runtimeInventory = sanitizeRuntimeInventory(heartbeat.inventory, timestamp);
       const cpu = numberMetric(heartbeat.metrics?.cpu, previous.cpu);
       const memory = numberMetric(heartbeat.metrics?.memory, previous.memory);
       const disk = numberMetric(heartbeat.metrics?.disk, previous.disk);
@@ -492,7 +610,6 @@ export function createOpsServer(options: OpsServerOptions) {
       }
       if (heartbeat.system?.address !== undefined && typeof heartbeat.system.address !== "string") throw new HttpError(400, "heartbeat.system.address must be a string");
       if (heartbeat.system?.os !== undefined && typeof heartbeat.system.os !== "string") throw new HttpError(400, "heartbeat.system.os must be a string");
-      const timestamp = new Date().toISOString();
       const heartbeatProjects = heartbeat.projects ?? [];
       const reportedProjectIds = heartbeatProjects
         .filter((project) => project && typeof project === "object" && typeof project.id === "string" && project.id)
@@ -509,6 +626,7 @@ export function createOpsServer(options: OpsServerOptions) {
           address: heartbeat.system?.address,
           os: heartbeat.system?.os,
           agentVersion: heartbeat.agentVersion?.slice(0, 100),
+          runtimeInventory,
         });
         for (const project of heartbeatProjects) {
           if (!project || typeof project !== "object" || typeof project.id !== "string" || !project.id) continue;

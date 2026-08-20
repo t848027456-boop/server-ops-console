@@ -7,6 +7,7 @@
 ## 已可用
 
 - 真实 CPU、内存、负载、磁盘、Docker 和 systemd 状态采集
+- 自动发现 Docker/Compose 容器与运行中的 systemd 服务，并按服务器展示只读运行清单
 - Compose、systemd、HTTP 项目的进程与 HTTP 健康检查
 - Agent 心跳、失联判定、磁盘和项目异常告警
 - 受控刷新、Compose/systemd 重启、发布前门禁检查
@@ -66,7 +67,10 @@ SQLite 数据保存在 `ops-console-data` 卷中。默认只发布到宿主机 `
 1. 在“服务器”页创建接入凭据。
 2. 使用返回的一次性配置创建 `agent.config.json`。
 3. 构建并运行 `agent/dist/ops-agent.cjs`。
-4. 在“项目”页登记项目，将生成的项目对象加入 Agent 配置的 `projects` 数组后重启 Agent。
+4. Agent 首次心跳会自动上报 Docker/Compose 和运行中的 systemd 只读清单，无需逐个登记即可盘点服务器。
+5. 需要健康检查或重启、预检等受控操作时，再在“项目”页登记项目，将生成的项目对象加入 Agent 配置的 `projects` 数组后重启 Agent。
+
+自动发现不等于授权操作。运行清单不接收网页命令，也不会自动把基础设施或未知容器注册成可操作项目；只有控制端和 Agent 使用相同项目 ID 的已登记项目，才能执行其白名单动作。
 
 Linux systemd 安装步骤见 [agent/README.md](agent/README.md)，控制端环境变量和 API 见 [server/README.md](server/README.md)。
 

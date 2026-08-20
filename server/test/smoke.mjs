@@ -5,12 +5,27 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { WebSocket } from "ws";
 import { createOpsServer } from "../dist/app.js";
+import { OpsDatabase } from "../dist/db.js";
 
 const temporaryDirectory = mkdtempSync(join(tmpdir(), "ops-console-smoke-"));
 const frontendDirectory = mkdtempSync(join(tmpdir(), "ops-console-frontend-"));
 const bootstrapBundlePath = join(temporaryDirectory, "ops-agent.cjs");
 writeFileSync(join(frontendDirectory, "index.html"), "<!doctype html><html><body><div id=\"root\"></div></body></html>\n");
 writeFileSync(bootstrapBundlePath, "#!/usr/bin/env node\nconsole.log('fake bundled agent');\n");
+
+const migrationDatabasePath = join(temporaryDirectory, "pre-inventory.sqlite");
+const preInventoryDatabase = new OpsDatabase(migrationDatabasePath);
+preInventoryDatabase.upsertServer({ id: "legacy-server", name: "Legacy Server" });
+preInventoryDatabase.sqlite.exec("ALTER TABLE servers DROP COLUMN runtime_inventory_json");
+preInventoryDatabase.sqlite.exec("ALTER TABLE servers DROP COLUMN runtime_inventory_fresh");
+preInventoryDatabase.close();
+const migratedInventoryDatabase = new OpsDatabase(migrationDatabasePath);
+const migratedServerColumns = migratedInventoryDatabase.sqlite.prepare("PRAGMA table_info(servers)").all();
+assert(migratedServerColumns.some((column) => column.name === "runtime_inventory_json"));
+assert(migratedServerColumns.some((column) => column.name === "runtime_inventory_fresh"));
+assert.equal(migratedInventoryDatabase.getServer("legacy-server").runtime_inventory_json, null);
+assert.equal(migratedInventoryDatabase.getServer("legacy-server").runtime_inventory_fresh, 0);
+migratedInventoryDatabase.close();
 
 const hostKeyType = Buffer.from("ssh-ed25519", "ascii");
 const fakeHostKey = Buffer.concat([
@@ -322,6 +337,7 @@ try {
   assert.equal(bootstrapJob.data.progress, 100);
   const generatedServer = (await api("/api/v1/servers")).data.find((server) => server.id === bootstrapStarted.data.serverId);
   assert.equal(generatedServer.name, "US大鸡");
+  assert.equal(generatedServer.runtimeInventory, null);
   const uploadedService = [...bootstrapUploads.entries()].find(([path]) => path.endsWith(".service"));
   assert(uploadedService && uploadedService[1].toString("utf8").includes("ExecStart=/usr/bin/node /opt/server-ops-agent/ops-agent.cjs"));
   const persistedBootstrapText = JSON.stringify(app.db.sqlite.prepare("SELECT * FROM audit_events").all());
@@ -333,6 +349,7 @@ try {
     body: JSON.stringify({ id: "smoke-server", name: "Smoke Server", region: "local", address: "2001:DB8::12", os: "Debian 12" }),
   }, 201);
   assert(enrollment.data.agentToken);
+  assert.equal(enrollment.data.server.runtimeInventory, null);
 
   const project = await api("/api/v1/projects", {
     method: "POST",
@@ -481,10 +498,50 @@ try {
   agent.send(JSON.stringify({ type: "heartbeat", agentVersion: { invalid: true }, projects: {} }));
   assert.equal((await receive((message) => message.type === "error")).code, "invalid_message");
 
+  const inventorySecret = "inventory-secret-must-not-persist";
   const heartbeat = {
     type: "heartbeat",
-    agentVersion: "0.1.0-smoke",
+    agentVersion: "0.2.0-smoke",
     metrics: { cpu: 23.5, memory: 51.2, disk: 91.4, load: 0.42 },
+    inventory: {
+      collectedAt: new Date().toISOString(),
+      docker: {
+        available: true,
+        version: `27.5.1${"v".repeat(120)}`,
+        truncated: false,
+        containers: Array.from({ length: 70 }, (_, index) => ({
+          id: `${index}`.padStart(64, "a"),
+          name: index === 0 ? `web-${"n".repeat(180)}` : `container-${index}`,
+          image: index === 0
+            ? `registry.example.invalid/team/image:${"i".repeat(400)}`
+            : index === 1 ? `registry.example.invalid/image:latest?token=${inventorySecret}` : `image-${index}:latest`,
+          state: "running",
+          health: "healthy",
+          restartCount: index === 0 ? 2_000_000 : index,
+          ports: index === 0 ? "127.0.0.1:8080->8080/tcp,".repeat(30) : `${8000 + index}->80/tcp`,
+          composeProject: index === 0 ? `compose-${"p".repeat(180)}` : "smoke-stack",
+          composeService: index === 0 ? `service-${"s".repeat(180)}` : `service-${index}`,
+          workingDirectory: index === 0 ? `/opt/${"w".repeat(500)}` : "/opt/smoke",
+          configFiles: index === 0
+            ? Array.from({ length: 6 }, (__, fileIndex) => `/opt/${"c".repeat(450)}-${fileIndex}.yaml`)
+            : ["/opt/smoke/compose.yaml"],
+          labels: `PASSWORD=${inventorySecret}`,
+          env: [`TOKEN=${inventorySecret}`],
+        })),
+      },
+      systemd: {
+        available: true,
+        truncated: false,
+        services: Array.from({ length: 130 }, (_, index) => ({
+          unit: `smoke-${index}.service`,
+          description: index === 0 ? `Smoke ${"d".repeat(400)}` : `Smoke service ${index}`,
+          activeState: "active",
+          subState: "running",
+          environment: `SECRET=${inventorySecret}`,
+        })),
+      },
+      labels: { password: inventorySecret },
+    },
     projects: [
       {
         id: "smoke-project",
@@ -515,7 +572,43 @@ try {
   const smokeServer = servers.data.find((item) => item.id === "smoke-server");
   assert.equal(smokeServer.health, "warning");
   assert.equal(smokeServer.agentConnected, true);
+  assert.equal(smokeServer.runtimeInventoryFresh, true);
   assert.equal(smokeServer.disk, 91.4);
+  assert.equal(smokeServer.runtimeInventory.docker.containers.length, 64);
+  assert.equal(smokeServer.runtimeInventory.docker.truncated, true);
+  assert.equal(smokeServer.runtimeInventory.systemd.services.length, 128);
+  assert.equal(smokeServer.runtimeInventory.systemd.truncated, true);
+  const boundedContainer = smokeServer.runtimeInventory.docker.containers[0];
+  assert.equal(boundedContainer.name.length, 128);
+  assert.equal(boundedContainer.image.length, 256);
+  assert.equal(boundedContainer.ports.length, 512);
+  assert.equal(boundedContainer.composeProject.length, 128);
+  assert.equal(boundedContainer.workingDirectory.length, 384);
+  assert.equal(boundedContainer.configFiles.length, 4);
+  assert.equal(boundedContainer.configFiles[0].length, 384);
+  assert.equal(boundedContainer.restartCount, 1_000_000);
+  assert.match(smokeServer.runtimeInventory.docker.containers[1].image, /token=\[redacted\]/);
+  assert.equal(smokeServer.runtimeInventory.systemd.services[0].description.length, 256);
+  assert(!JSON.stringify(smokeServer.runtimeInventory).includes(inventorySecret));
+  assert(!JSON.stringify(smokeServer.runtimeInventory).includes("labels"));
+  assert(!JSON.stringify(app.db.getServer("smoke-server")).includes(inventorySecret));
+
+  const serverDetail = await api("/api/v1/servers/smoke-server");
+  assert.deepEqual(serverDetail.data.runtimeInventory, smokeServer.runtimeInventory);
+
+  const inventoryBeforeLegacyHeartbeat = app.db.getServer("smoke-server").runtime_inventory_json;
+  const { inventory: _inventory, ...legacyHeartbeatBase } = heartbeat;
+  const legacyHeartbeat = { ...legacyHeartbeatBase, agentVersion: "0.1.1-smoke" };
+  agent.send(JSON.stringify(legacyHeartbeat));
+  await receive((message) => message.type === "heartbeat_ack");
+  assert.equal(app.db.getServer("smoke-server").runtime_inventory_json, inventoryBeforeLegacyHeartbeat);
+  assert.equal(app.db.getServer("smoke-server").runtime_inventory_fresh, 0);
+
+  agent.send(JSON.stringify({ ...heartbeat, inventory: { docker: [], systemd: { available: true, services: [] } } }));
+  const malformedInventoryError = await receive((message) => message.type === "error");
+  assert.equal(malformedInventoryError.code, "invalid_message");
+  assert.match(malformedInventoryError.message, /heartbeat\.inventory\.docker must be an object/);
+  assert.equal(app.db.getServer("smoke-server").runtime_inventory_json, inventoryBeforeLegacyHeartbeat);
 
   let projects = await api("/api/v1/projects");
   assert.equal(projects.data.find((item) => item.id === "smoke-project").version, "abc1234");
@@ -524,6 +617,7 @@ try {
 
   agent.send(JSON.stringify({ ...heartbeat, projects: [heartbeat.projects[0]] }));
   await receive((message) => message.type === "heartbeat_ack");
+  assert.equal(app.db.getServer("smoke-server").runtime_inventory_fresh, 1);
   projects = await api("/api/v1/projects");
   const missingProject = projects.data.find((item) => item.id === "missing-project");
   assert.equal(missingProject.health, "unknown");
@@ -785,6 +879,10 @@ try {
   bootstrapBaseUrl = baseUrl;
 
   const restartedJobs = await api("/api/v1/servers/bootstrap");
+  const persistedInventoryAfterRestart = await api("/api/v1/servers/smoke-server");
+  assert.equal(persistedInventoryAfterRestart.data.runtimeInventory.docker.containers.length, 64);
+  assert.equal(persistedInventoryAfterRestart.data.runtimeInventory.systemd.services.length, 128);
+  assert(!JSON.stringify(persistedInventoryAfterRestart.data.runtimeInventory).includes(inventorySecret));
   const recoveredBootstrap = restartedJobs.data.find((item) => item.id === "bootstrap-recovery-smoke");
   assert.equal(recoveredBootstrap.status, "rollback_unknown");
   assert.equal(recoveredBootstrap.stage, "recovery_required");

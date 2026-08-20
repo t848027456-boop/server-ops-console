@@ -1,7 +1,7 @@
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import type { ProjectRow, ServerRow, TaskKind, TaskRow, TaskStatus } from "./types.js";
+import type { ProjectRow, RuntimeInventory, ServerRow, TaskKind, TaskRow, TaskStatus } from "./types.js";
 
 export interface BootstrapPreflightRow {
   id: string;
@@ -110,6 +110,8 @@ export class OpsDatabase {
         load TEXT NOT NULL DEFAULT '0',
         last_heartbeat TEXT,
         agent_version TEXT,
+        runtime_inventory_json TEXT,
+        runtime_inventory_fresh INTEGER NOT NULL DEFAULT 0,
         agent_token_hash TEXT,
         maintenance_mode INTEGER NOT NULL DEFAULT 0,
         created_at TEXT NOT NULL,
@@ -288,6 +290,13 @@ export class OpsDatabase {
     const taskColumns = this.sqlite.prepare("PRAGMA table_info(tasks)").all() as Array<{ name: string }>;
     if (!taskColumns.some((column) => column.name === "cancel_requested")) {
       this.sqlite.exec("ALTER TABLE tasks ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0");
+    }
+    const serverColumns = this.sqlite.prepare("PRAGMA table_info(servers)").all() as Array<{ name: string }>;
+    if (!serverColumns.some((column) => column.name === "runtime_inventory_json")) {
+      this.sqlite.exec("ALTER TABLE servers ADD COLUMN runtime_inventory_json TEXT");
+    }
+    if (!serverColumns.some((column) => column.name === "runtime_inventory_fresh")) {
+      this.sqlite.exec("ALTER TABLE servers ADD COLUMN runtime_inventory_fresh INTEGER NOT NULL DEFAULT 0");
     }
     const bootstrapJobColumns = this.sqlite.prepare("PRAGMA table_info(bootstrap_jobs)").all() as Array<{ name: string }>;
     if (!bootstrapJobColumns.some((column) => column.name === "request_hash")) {
@@ -601,10 +610,10 @@ export class OpsDatabase {
   restoreServer(row: ServerRow) {
     this.sqlite.prepare(`UPDATE servers SET name = ?, region = ?, address = ?, os = ?, health = ?,
       cpu = ?, memory = ?, disk = ?, load = ?, last_heartbeat = ?, agent_version = ?,
-      agent_token_hash = ?, maintenance_mode = ?, created_at = ?, updated_at = ? WHERE id = ?`).run(
+      runtime_inventory_json = ?, runtime_inventory_fresh = ?, agent_token_hash = ?, maintenance_mode = ?, created_at = ?, updated_at = ? WHERE id = ?`).run(
       row.name, row.region, row.address, row.os, row.health, row.cpu, row.memory, row.disk, row.load,
-      row.last_heartbeat, row.agent_version, row.agent_token_hash, row.maintenance_mode,
-      row.created_at, row.updated_at, row.id,
+      row.last_heartbeat, row.agent_version, row.runtime_inventory_json, row.runtime_inventory_fresh ?? 0,
+      row.agent_token_hash, row.maintenance_mode, row.created_at, row.updated_at, row.id,
     );
     return this.getServer(row.id);
   }
@@ -627,14 +636,18 @@ export class OpsDatabase {
     address?: string;
     os?: string;
     agentVersion?: string;
+    runtimeInventory?: RuntimeInventory;
   }) {
+    const runtimeInventoryJson = input.runtimeInventory ? JSON.stringify(input.runtimeInventory) : null;
+    const runtimeInventoryFresh = input.runtimeInventory ? 1 : 0;
     this.sqlite.prepare(`
       UPDATE servers SET health = ?, cpu = ?, memory = ?, disk = ?, load = ?,
         last_heartbeat = ?, address = COALESCE(NULLIF(?, ''), address),
-        os = COALESCE(NULLIF(?, ''), os), agent_version = COALESCE(?, agent_version), updated_at = ?
+        os = COALESCE(NULLIF(?, ''), os), agent_version = COALESCE(?, agent_version),
+        runtime_inventory_json = COALESCE(?, runtime_inventory_json), runtime_inventory_fresh = ?, updated_at = ?
       WHERE id = ?
     `).run(input.health, input.cpu, input.memory, input.disk, input.load, input.timestamp,
-      input.address ?? "", input.os ?? "", input.agentVersion ?? null, isoNow(), serverId);
+      input.address ?? "", input.os ?? "", input.agentVersion ?? null, runtimeInventoryJson, runtimeInventoryFresh, isoNow(), serverId);
   }
 
   listProjects() {

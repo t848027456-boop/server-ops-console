@@ -9,9 +9,15 @@ import { promisify } from "node:util";
 import WebSocket from "ws";
 
 const execFileAsync = promisify(execFile);
-const AGENT_VERSION = "0.1.1";
+const AGENT_VERSION = "0.2.0";
 const DEFAULT_INTERVAL_MS = 10_000;
 const MAX_OUTPUT_BYTES = 2 * 1024 * 1024;
+const MAX_INTERNAL_DOCKER_CONTAINERS = 256;
+const MAX_INTERNAL_SYSTEMD_SERVICES = 256;
+const MAX_HEARTBEAT_DOCKER_CONTAINERS = 48;
+const MAX_HEARTBEAT_SYSTEMD_SERVICES = 96;
+const MAX_HEARTBEAT_BYTES = 224 * 1024;
+const MAX_COMPOSE_CONFIG_FILES = 4;
 
 let previousCpuSample = null;
 let reconnectAttempt = 0;
@@ -164,6 +170,10 @@ function parseKeyValueLines(text) {
   return result;
 }
 
+function compactString(value, maximum) {
+  return String(value ?? "").replace(/[\u0000-\u001f\u007f]/g, " ").trim().slice(0, maximum);
+}
+
 async function getOsDescription() {
   if (process.platform !== "linux") return `${os.type()} ${os.release()}`;
   try {
@@ -175,56 +185,142 @@ async function getOsDescription() {
   }
 }
 
-async function getDockerSnapshot() {
+function configuredDockerSelectors(projects = []) {
+  const names = new Set();
+  const composeProjects = new Set();
+  for (const project of projects) {
+    if (!project || !["docker-compose", "docker"].includes(project.type)) continue;
+    const processConfig = project.process || {};
+    for (const name of Array.isArray(processConfig.containers) ? processConfig.containers : []) {
+      if (typeof name === "string" && name.trim()) names.add(name.trim());
+    }
+    if (typeof processConfig.composeProject === "string" && processConfig.composeProject.trim()) composeProjects.add(processConfig.composeProject.trim());
+  }
+  return { names, composeProjects };
+}
+
+function isConfiguredDockerContainer(container, selectors) {
+  return selectors.names.has(container.name) || (container.composeProject && selectors.composeProjects.has(container.composeProject));
+}
+
+async function getDockerSnapshot(projects = []) {
   const version = await runProgram("docker", ["version", "--format", "{{.Server.Version}}"], { timeoutMs: 8_000 });
   if (!version.ok) {
-    return { available: false, version: null, containers: [], error: version.stderr || "docker unavailable" };
+    return { available: false, version: null, containers: [], truncated: false, error: version.stderr || "docker unavailable" };
   }
 
   const listing = await runProgram("docker", ["ps", "-a", "--no-trunc", "--format", "{{json .}}"], { timeoutMs: 12_000 });
-  if (!listing.ok) {
-    return { available: true, version: version.stdout, containers: [], error: listing.stderr };
-  }
+  if (!listing.ok) return { available: false, version: compactString(version.stdout, 100), containers: [], truncated: false, error: listing.stderr || "docker ps failed" };
 
-  const containers = [];
-  for (const line of listing.stdout.split(/\r?\n/).filter(Boolean)) {
+  const parsedContainers = [];
+  const listingRows = listing.stdout.split(/\r?\n/).filter(Boolean);
+  for (const line of listingRows) {
     try {
       const item = JSON.parse(line);
-      containers.push({
-        id: item.ID,
-        name: item.Names,
-        image: item.Image,
-        state: item.State,
-        status: item.Status,
-        labels: item.Labels || "",
-        ports: item.Ports || "",
+      const id = compactString(item.ID, 64);
+      if (!id) continue;
+      parsedContainers.push({
+        id,
+        name: compactString(item.Names, 128) || id.slice(0, 12),
+        image: compactString(item.Image, 256) || "unknown",
+        state: compactString(item.State, 32) || "unknown",
+        health: compactString(item.State, 32) || "unknown",
+        restartCount: 0,
+        ports: compactString(item.Ports, 512),
+        composeProject: null,
+        composeService: null,
+        workingDirectory: null,
+        configFiles: [],
       });
     } catch {
       // Ignore one malformed Docker row without dropping the whole snapshot.
     }
   }
 
-  const validIds = containers.map((item) => item.id).filter((id) => /^[a-f0-9]{12,64}$/i.test(id));
+  const validIds = parsedContainers.map((item) => item.id).filter((id) => /^[a-f0-9]{12,64}$/i.test(id));
   if (validIds.length > 0) {
-    const inspection = await runProgram(
+    const inspectFormat = "[{{json .Id}},{{json .RestartCount}},{{json .State.Status}},{{if .State.Health}}{{json .State.Health.Status}}{{else}}null{{end}},{{json (index .Config.Labels \"com.docker.compose.project\")}},{{json (index .Config.Labels \"com.docker.compose.service\")}},{{json (index .Config.Labels \"com.docker.compose.project.working_dir\")}},{{json (index .Config.Labels \"com.docker.compose.project.config_files\")}}]";
+    const batches = [];
+    for (let index = 0; index < validIds.length; index += 128) batches.push(validIds.slice(index, index + 128));
+    const inspections = await Promise.all(batches.map((batch) => runProgram(
       "docker",
-      ["inspect", "--format", "{{.Id}}|{{.RestartCount}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}|{{index .Config.Labels \"com.docker.compose.project\"}}|{{index .Config.Labels \"com.docker.compose.service\"}}", ...validIds],
+      ["inspect", "--format", inspectFormat, ...batch],
       { timeoutMs: 15_000 },
-    );
-    if (inspection.ok) {
-      const details = new Map();
+    )));
+    const details = new Map();
+    for (const inspection of inspections) {
+      if (!inspection.ok) continue;
       for (const line of inspection.stdout.split(/\r?\n/)) {
-        const [id, restartCount, health, composeProject, composeService] = line.split("|");
-        details.set(id, { restartCount: Number(restartCount || 0), health, composeProject, composeService });
+        try {
+          const [id, restartCount, state, health, composeProject, composeService, workingDirectory, rawConfigFiles] = JSON.parse(line);
+          const normalizedId = compactString(id, 64);
+          if (!normalizedId) continue;
+          const numericRestartCount = Number(restartCount);
+          details.set(normalizedId, {
+            restartCount: Number.isFinite(numericRestartCount) ? Math.min(1_000_000, Math.max(0, Math.floor(numericRestartCount))) : 0,
+            state: compactString(state, 32) || "unknown",
+            health: compactString(health || state, 32) || "unknown",
+            composeProject: compactString(composeProject, 128) || null,
+            composeService: compactString(composeService, 128) || null,
+            workingDirectory: compactString(workingDirectory, 384) || null,
+            configFiles: String(rawConfigFiles || "").split(",")
+              .map((file) => compactString(file, 384))
+              .filter(Boolean)
+              .slice(0, MAX_COMPOSE_CONFIG_FILES),
+          });
+        } catch {
+          // Ignore a malformed inspect row without exposing raw inspect data.
+        }
       }
-      for (const container of containers) {
-        const detail = details.get(container.id);
-        if (detail) Object.assign(container, detail);
-      }
+    }
+    for (const container of parsedContainers) {
+      const detail = details.get(container.id);
+      if (detail) Object.assign(container, detail);
     }
   }
 
-  return { available: true, version: version.stdout, containers, error: null };
+  const selectors = configuredDockerSelectors(projects);
+  const configuredContainers = parsedContainers.filter((container) => isConfiguredDockerContainer(container, selectors));
+  const discoveredContainers = parsedContainers.filter((container) => !isConfiguredDockerContainer(container, selectors));
+  const containers = configuredContainers.length >= MAX_INTERNAL_DOCKER_CONTAINERS
+    ? configuredContainers
+    : configuredContainers.concat(discoveredContainers.slice(0, MAX_INTERNAL_DOCKER_CONTAINERS - configuredContainers.length));
+
+  return {
+    available: true,
+    version: compactString(version.stdout, 100),
+    containers,
+    truncated: parsedContainers.length > containers.length,
+    error: null,
+  };
+}
+
+async function getRunningSystemdServices() {
+  if (process.platform !== "linux") return { available: false, services: [], truncated: false };
+  const result = await runProgram(
+    "systemctl",
+    ["list-units", "--type=service", "--state=running", "--no-legend", "--no-pager", "--plain"],
+    { timeoutMs: 10_000 },
+  );
+  if (!result.ok) return { available: false, services: [], truncated: false };
+
+  const rows = result.stdout.split(/\r?\n/).filter(Boolean);
+  const services = [];
+  for (const row of rows.slice(0, MAX_INTERNAL_SYSTEMD_SERVICES)) {
+    const match = /^(\S+)\s+(\S+)\s+(\S+)\s+(\S+)(?:\s+(.*))?$/.exec(row.trim());
+    if (!match || !validateUnit(match[1]) || match[3] !== "active") continue;
+    services.push({
+      unit: compactString(match[1], 160),
+      description: compactString(match[5], 256) || compactString(match[1], 160),
+      activeState: compactString(match[3], 32),
+      subState: compactString(match[4], 32),
+    });
+  }
+  return {
+    available: true,
+    services,
+    truncated: rows.length > MAX_INTERNAL_SYSTEMD_SERVICES,
+  };
 }
 
 function validateUnit(unit) {
@@ -375,10 +471,11 @@ async function collectProject(project, context) {
 }
 
 async function collectSnapshot(config) {
-  const [disk, docker, osDescription] = await Promise.all([
+  const [disk, docker, osDescription, runningSystemd] = await Promise.all([
     getDiskUsage(),
-    getDockerSnapshot(),
+    getDockerSnapshot(config.projects),
     getOsDescription(),
+    getRunningSystemdServices(),
   ]);
 
   const units = [...new Set(config.projects.filter((project) => project.type === "systemd").map((project) => project.process?.unit).filter(validateUnit))];
@@ -414,7 +511,7 @@ async function collectSnapshot(config) {
     runtime: {
       docker,
       systemd: {
-        available: process.platform === "linux",
+        ...runningSystemd,
         units: unitResults,
       },
     },
@@ -426,9 +523,29 @@ function send(message) {
   if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify(message));
 }
 
+function fitHeartbeatInventory(message) {
+  const payloadBytes = () => Buffer.byteLength(JSON.stringify(message));
+  while (payloadBytes() > MAX_HEARTBEAT_BYTES && message.inventory.docker.containers.length > 0) {
+    message.inventory.docker.containers.pop();
+    message.inventory.docker.truncated = true;
+  }
+  while (payloadBytes() > MAX_HEARTBEAT_BYTES && message.inventory.systemd.services.length > 0) {
+    message.inventory.systemd.services.pop();
+    message.inventory.systemd.truncated = true;
+  }
+  if (payloadBytes() > MAX_HEARTBEAT_BYTES) {
+    message.inventory.docker.containers = [];
+    message.inventory.docker.truncated = true;
+    message.inventory.systemd.services = [];
+    message.inventory.systemd.truncated = true;
+  }
+  if (payloadBytes() > MAX_HEARTBEAT_BYTES) delete message.inventory;
+  return message;
+}
+
 async function sendSnapshot(config) {
   const snapshot = await collectSnapshot(config);
-  send({
+  const heartbeat = {
     type: "heartbeat",
     timestamp: snapshot.sentAt,
     health: snapshot.metrics.disk.available && snapshot.metrics.disk.percent >= 90 ? "warning" : "healthy",
@@ -443,6 +560,34 @@ async function sendSnapshot(config) {
       address: snapshot.server.address,
       os: snapshot.server.os,
     },
+    inventory: {
+      collectedAt: snapshot.sentAt,
+      docker: {
+        available: snapshot.runtime.docker.available,
+        version: snapshot.runtime.docker.version,
+        truncated: snapshot.runtime.docker.truncated
+          || snapshot.runtime.docker.containers.length > MAX_HEARTBEAT_DOCKER_CONTAINERS,
+        containers: snapshot.runtime.docker.containers.slice(0, MAX_HEARTBEAT_DOCKER_CONTAINERS).map((container) => ({
+          id: container.id,
+          name: container.name,
+          image: container.image,
+          state: container.state,
+          health: container.health,
+          restartCount: container.restartCount,
+          ports: container.ports,
+          composeProject: container.composeProject,
+          composeService: container.composeService,
+          workingDirectory: container.workingDirectory,
+          configFiles: container.configFiles,
+        })),
+      },
+      systemd: {
+        available: snapshot.runtime.systemd.available,
+        truncated: snapshot.runtime.systemd.truncated
+          || snapshot.runtime.systemd.services.length > MAX_HEARTBEAT_SYSTEMD_SERVICES,
+        services: snapshot.runtime.systemd.services.slice(0, MAX_HEARTBEAT_SYSTEMD_SERVICES),
+      },
+    },
     projects: snapshot.projects.map((project) => ({
       id: project.id,
       health: project.health,
@@ -453,7 +598,8 @@ async function sendSnapshot(config) {
       responseTime: project.responseTime,
       updateAvailable: project.updateAvailable,
     })),
-  });
+  };
+  send(fitHeartbeatInventory(heartbeat));
   return snapshot;
 }
 
