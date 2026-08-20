@@ -596,6 +596,14 @@ try {
   const serverDetail = await api("/api/v1/servers/smoke-server");
   assert.deepEqual(serverDetail.data.runtimeInventory, smokeServer.runtimeInventory);
 
+  const inventoryOverview = await api("/api/v1/overview");
+  assert.deepEqual(inventoryOverview.data.runtimeInventory, {
+    servers: { total: 2, fresh: 1, stale: 0, unavailable: 1 },
+    compose: { groups: 2, containers: 64, running: 64, unhealthy: 0 },
+    systemd: { services: 128, active: 128, failed: 0 },
+    staleServers: 0,
+  });
+
   const inventoryBeforeLegacyHeartbeat = app.db.getServer("smoke-server").runtime_inventory_json;
   const { inventory: _inventory, ...legacyHeartbeatBase } = heartbeat;
   const legacyHeartbeat = { ...legacyHeartbeatBase, agentVersion: "0.1.1-smoke" };
@@ -603,6 +611,13 @@ try {
   await receive((message) => message.type === "heartbeat_ack");
   assert.equal(app.db.getServer("smoke-server").runtime_inventory_json, inventoryBeforeLegacyHeartbeat);
   assert.equal(app.db.getServer("smoke-server").runtime_inventory_fresh, 0);
+  const staleInventoryOverview = await api("/api/v1/overview");
+  assert.deepEqual(staleInventoryOverview.data.runtimeInventory, {
+    servers: { total: 2, fresh: 0, stale: 1, unavailable: 1 },
+    compose: { groups: 2, containers: 64, running: 0, unhealthy: 0 },
+    systemd: { services: 128, active: 0, failed: 0 },
+    staleServers: 1,
+  });
 
   agent.send(JSON.stringify({ ...heartbeat, inventory: { docker: [], systemd: { available: true, services: [] } } }));
   const malformedInventoryError = await receive((message) => message.type === "error");

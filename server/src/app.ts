@@ -7,7 +7,7 @@ import type { Client } from "ssh2";
 import { BootstrapError, BootstrapManager } from "./bootstrap.js";
 import { OpsDatabase } from "./db.js";
 import { hashToken, parseBearer, redact, tokenMatches } from "./security.js";
-import { taskKinds, type AgentHeartbeat, type AgentMessage, type AgentSession, type Health, type ProjectRow, type RuntimeInventory, type ServerRow, type TaskKind, type TaskRow } from "./types.js";
+import { taskKinds, type AgentHeartbeat, type AgentMessage, type AgentSession, type Health, type ProjectRow, type RuntimeInventory, type RuntimeInventoryOverview, type ServerRow, type TaskKind, type TaskRow } from "./types.js";
 
 const terminalStatuses = new Set(["succeeded", "failed", "cancelled"]);
 const healthValues = new Set<Health>(["healthy", "warning", "critical", "offline", "unknown"]);
@@ -227,6 +227,10 @@ function sanitizeRuntimeInventory(value: unknown, receivedAt: string): RuntimeIn
   };
 }
 
+function runtimeRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
+}
+
 function parseStoredRuntimeInventory(value: string | null): RuntimeInventory | null {
   if (!value) return null;
   try {
@@ -235,6 +239,67 @@ function parseStoredRuntimeInventory(value: string | null): RuntimeInventory | n
   } catch {
     return null;
   }
+}
+
+function summarizeRuntimeInventories(
+  rows: Array<Pick<ServerRow, "id" | "last_heartbeat" | "runtime_inventory_json" | "runtime_inventory_fresh">>,
+  isServerOnline: (lastHeartbeat: string | null) => boolean,
+): RuntimeInventoryOverview {
+  const result: RuntimeInventoryOverview = {
+    servers: { total: rows.length, fresh: 0, stale: 0, unavailable: 0 },
+    compose: { groups: 0, containers: 0, running: 0, unhealthy: 0 },
+    systemd: { services: 0, active: 0, failed: 0 },
+    staleServers: 0,
+  };
+  const composeGroups = new Set<string>();
+
+  for (const row of rows) {
+    const inventory = runtimeRecord(parseStoredRuntimeInventory(row.runtime_inventory_json));
+    const docker = runtimeRecord(inventory?.docker);
+    const systemd = runtimeRecord(inventory?.systemd);
+    const containers = Array.isArray(docker?.containers) ? docker.containers : [];
+    const services = Array.isArray(systemd?.services) ? systemd.services : [];
+    if (!inventory || !docker || !systemd || !Array.isArray(docker.containers) || !Array.isArray(systemd.services)) {
+      result.servers.unavailable += 1;
+      continue;
+    }
+
+    const fresh = Boolean(row.runtime_inventory_fresh) && isServerOnline(row.last_heartbeat);
+    if (fresh) result.servers.fresh += 1;
+    else {
+      result.servers.stale += 1;
+      result.staleServers += 1;
+    }
+
+    for (const [index, rawContainer] of containers.entries()) {
+      const container = runtimeRecord(rawContainer);
+      if (!container) continue;
+      result.compose.containers += 1;
+      const composeProject = typeof container.composeProject === "string" ? container.composeProject : null;
+      const containerId = typeof container.id === "string" ? container.id : typeof container.name === "string" ? container.name : String(index);
+      const group = composeProject ? `compose:${row.id}:${composeProject}` : `container:${row.id}:${containerId}`;
+      composeGroups.add(group);
+      if (!fresh) continue;
+      const state = typeof container.state === "string" ? container.state.trim().toLowerCase() : "unknown";
+      const health = typeof container.health === "string" ? container.health.trim().toLowerCase() : "unknown";
+      if (state === "running") result.compose.running += 1;
+      if (state !== "running" || health === "unhealthy") result.compose.unhealthy += 1;
+    }
+
+    for (const rawService of services) {
+      const service = runtimeRecord(rawService);
+      if (!service) continue;
+      result.systemd.services += 1;
+      if (!fresh) continue;
+      const activeState = typeof service.activeState === "string" ? service.activeState.trim().toLowerCase() : "unknown";
+      const subState = typeof service.subState === "string" ? service.subState.trim().toLowerCase() : "unknown";
+      if (activeState === "active") result.systemd.active += 1;
+      if (activeState === "failed" || subState === "failed") result.systemd.failed += 1;
+    }
+  }
+
+  result.compose.groups = composeGroups.size;
+  return result;
 }
 
 function parseLimit(url: URL, maximum = 500) {
@@ -770,7 +835,8 @@ export function createOpsServer(options: OpsServerOptions) {
 
     if (method === "GET" && path === "/api/v1/overview") {
       reconcileOfflineAlerts();
-      const servers = db.listServers().map(serializeServer);
+      const serverRows = db.listServers();
+      const servers = serverRows.map(serializeServer);
       const projects = db.listProjects().map(serializeProject);
       const counts = db.counts();
       const unresolved = db.listAlerts(500).map(serializeAlert).filter((item) => item.active && !item.acknowledged);
@@ -780,6 +846,7 @@ export function createOpsServer(options: OpsServerOptions) {
         alerts: { unresolved: counts.alerts, critical: unresolved.filter((alert) => alert.level === "critical").length },
         updatesAvailable: counts.updates,
         connectedAgents: sessions.size,
+        runtimeInventory: summarizeRuntimeInventories(serverRows, isOnline),
         generatedAt: new Date().toISOString(),
       } });
       return;

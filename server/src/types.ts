@@ -54,6 +54,27 @@ export interface RuntimeInventory {
   };
 }
 
+export interface RuntimeInventoryOverview {
+  servers: {
+    total: number;
+    fresh: number;
+    stale: number;
+    unavailable: number;
+  };
+  compose: {
+    groups: number;
+    containers: number;
+    running: number;
+    unhealthy: number;
+  };
+  systemd: {
+    services: number;
+    active: number;
+    failed: number;
+  };
+  staleServers: number;
+}
+
 export interface ServerRow {
   id: string;
   name: string;
